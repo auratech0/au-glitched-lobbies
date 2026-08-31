@@ -7,9 +7,9 @@ Many **open-source** components from [go0ty's SickoMenu](https://github.com/g0at
 
 Our Discord Servers:
 
-Tech Lounge: discord.gg/rj3fWwrc8Q
+Tech Lounge: [Discord](https://discord.gg/rj3fWwrc8Q)
 
-AU Glitched Lobbies: dsc.gg/AUGL
+AU Glitched Lobbies: [Discord](dsc.gg/AUGL)
 
 Join both of our Discords for test versions and to support us so we can continue producing more version of this mod and continue this long lived project of AUGL.
 
