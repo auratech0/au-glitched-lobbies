@@ -2,6 +2,8 @@
 Documentation for AUGL (Among Us Glitched Lobbies) along with its own mod menu and custom things
 
 Coded along with [Sparxist](https://github.com/Sparxist)
+Many **open-source** components from [go0ty's SickoMenu](https://github.com/g0aty/SickoMenu)
+Our Discord Servers either for Tech and Coding and a little Among Us
 
 # What is AUGL Mod/AUGL Menu?
 This is a multi-purpose but small menu meant to enhance gameplay. It's made for finding and creating Glitched Lobbies, packed with a custom regionInfo.json file with 7 modded regions (Modded EU, Modded AS, Modded NA, NikoEU, NikoAS, NikoNA and AllOfUs EU) and AUGL's own "region" which let's you create glitched lobbies **only** on official regions and **only** if they are available.
