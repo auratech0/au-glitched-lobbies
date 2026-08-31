@@ -3,7 +3,7 @@ Documentation for AUGL (Among Us Glitched Lobbies) along with its own mod menu a
 
 Coded along with [Sparxist](https://github.com/Sparxist)
 
-Many **open-source** components from [go0ty's SickoMenu](https://github.com/g0aty/SickoMenu)
+Many **open-source** components from [g0aty's SickoMenu](https://github.com/g0aty/SickoMenu)
 
 Our Discord Servers:
 
