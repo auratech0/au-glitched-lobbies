@@ -13,6 +13,20 @@ AU Glitched Lobbies: [Discord](dsc.gg/AUGL)
 
 Join both of our Discords for test versions and to support us so we can continue producing more version of this mod and continue this long lived project of AUGL.
 
+<details>
+<summary><b>🚨 CRITICAL DISCLAIMER & HARMONY HOOK WARNING (Click to expand)</b></summary>
+
+### ⚠️ HIGH-RISK EXPERIMENTAL ENVIRONMENT & BAN NOTICE
+This repository contains advanced BepInEx plugin features utilizing the Harmony hooking framework to alter runtime assembly logic and network event triggers.
+
+* **IMMEDIATE SERVER DETECTION:** Altering core game methods via runtime hooks will immediately trigger modern server-side validation checks (e.g., HostGuard or native Innersloth anti-cheat). This can result in permanent IP/HWID bans.
+* **NO LIABILITY:** As defined by the **Apache License 2.0**, this software is provided on an "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND. The authors assume zero responsibility for account status or game instability.
+* **NON-AFFILIATION:** This project is 100% unofficial and is NOT associated, affiliated, or officially connected with Innersloth LLC.
+
+*For the full legal and technical text, see the official [DISCLAIMER.md](https://auratech0/au-glitched-lobbies/DISCLAIMERS.md) file.*
+</details>
+
+---
 
 
 # What is AUGL Mod/AUGL Menu?
