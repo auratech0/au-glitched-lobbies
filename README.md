@@ -52,4 +52,4 @@ Many things, like 2 custom gamemodes (Shift And Seek and 0cd Shields), platform 
 # What's a glitched lobby?
 Glitched Among Us servers forget your level. In a glitch lobby, the server shows level 1, but your true level is higher, for example 100. This mismatch changes how the server counts your level gain. When the server tries to raise your level from 1 to 2, it uses your true level instead. The server raises your level from 100 to 101. This is how players raise their level past 100.
 
-Each lobby has a code. The last four letters of this code identify the server. Check these four letters against a list of glitch codes on [this](https://augl.net) website. This check tells you if your server is glitched. For example, assume code XYZW is a glitch code. Lobby ABXYZW ends in XYZW. This lobby would be glitched.
+Each lobby has a code. The last four letters of this code identify the server. Check these four letters against a list of glitch codes on [this](https://augl.net) website. This check tells you if your server is glitched. For example, assume code XYZW is a glitch code. Lobby ABXYZW ends in XYZW, hence this lobby would be glitched.
