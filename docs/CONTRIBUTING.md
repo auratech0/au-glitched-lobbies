@@ -2,7 +2,7 @@
 
 Thank you for your interest in contributing to **au-glitched-lobbies**! To maintain code quality, security, and project integrity, all contributors must follow these guidelines. 
 
-### 🤖 Strict AI-Generated Code Policy
+### Strict AI-Generated Code Policy
 
 We enforce a **zero-tolerance policy** regarding the misuse of Artificial Intelligence (AI) tools (such as ChatGPT, GitHub Copilot, Claude, etc.) in code submissions. 
 
