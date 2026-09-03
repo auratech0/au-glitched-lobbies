@@ -22,13 +22,13 @@ AU Glitched Lobbies: [Discord](https://dsc.gg/AUGL)
 Join both of our Discords for test versions and to support us so we can continue producing more versions of this mod and continue this long lived project of AUGL.
 
 <details>
-<summary><b>🚨 CRITICAL DISCLAIMER & HARMONY HOOK WARNING (Click to expand)</b></summary>
+<summary><b> CRITICAL DISCLAIMER & HARMONY HOOK WARNING (Click to expand)</b></summary>
 
-### ⚠️ HIGH-RISK EXPERIMENTAL ENVIRONMENT & BAN NOTICE
+### HIGH-RISK EXPERIMENTAL ENVIRONMENT & BAN NOTICE
 This repository contains advanced BepInEx plugin features, utilizing the Harmony hooking framework to alter runtime assembly logic and network event triggers.
 
-* **IMMEDIATE SERVER DETECTION:** Altering core game methods via runtime hooks will immediately trigger modern server-side validation checks (e.g., HostGuard or native Innersloth anti-cheat). This can result in permanent IP/HWID bans.
-* **NO LIABILITY:** As defined by the **Apache License 2.0**, this software is provided on an "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND. The authors assume zero responsibility for account status or game instability.
+* **IMMEDIATE SERVER DETECTION:** Altering core game methods via runtime hooks will immediately trigger modern server-side validation checks (e.g., native Innersloth anti-cheat). This can result in permanent IP/HWID bans.
+* **NO LIABILITY:** THIS PIECE OF OPEN-SOURCE, WHICH IS LICENSED AS AGPL 3.0 IS PROVIDED IN AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND. The authors assume zero responsibility for account status or game instability.
 * **NON-AFFILIATION:** This project is 100% unofficial and is NOT associated, affiliated, or officially connected with Innersloth LLC.
 
 *For the full legal and technical text, see the official [DISCLAIMERS.md](https://github.com/auratech0/au-glitched-lobbies/blob/main/docs/DISCLAIMERS.md) file.*
