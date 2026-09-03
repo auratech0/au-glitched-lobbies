@@ -1,3 +1,4 @@
+![description](https://i.postimg.cc/Nj1kk5Bp/AUGL.gif)
 [![GitHub Repo stars](https://img.shields.io/github/stars/auratech0/au-glitched-lobbies?style=flat&logo=github&color=yellow)](https://github.com/auratech0/au-glitched-lobbies/stargazers)
 [![Discord](https://img.shields.io/discord/1403448096066633748?style=flat&logo=discord&logoColor=white&label=Join%20Discord&color=5865F2)](https://discord.gg/HeNGYArCkY)
 ![C#](https://img.shields.io/badge/C%23-239120?style=flat&logo=c-sharp&logoColor=white)
