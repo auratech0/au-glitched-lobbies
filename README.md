@@ -5,7 +5,9 @@
 # augl-doc-n-menu
 Documentation for AUGL (Among Us Glitched Lobbies) along with its own mod menu and custom things
 
-Coded along with [Sparxist](https://github.com/Sparxist)
+Coded along with [Sparxist](https://github.com/Sparxist
+
+A big thanks to all of our contributors who put their time into this menu ❤️
 
 Many **open-source** components from [g0aty's SickoMenu](https://github.com/g0aty/SickoMenu)
 
