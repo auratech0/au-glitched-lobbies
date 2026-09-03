@@ -21,7 +21,7 @@ Join both of our Discords for test versions and to support us so we can continue
 <summary><b>🚨 CRITICAL DISCLAIMER & HARMONY HOOK WARNING (Click to expand)</b></summary>
 
 ### ⚠️ HIGH-RISK EXPERIMENTAL ENVIRONMENT & BAN NOTICE
-This repository contains advanced BepInEx plugin features utilizing the Harmony hooking framework to alter runtime assembly logic and network event triggers.
+This repository contains advanced BepInEx plugin features, utilizing the Harmony hooking framework to alter runtime assembly logic and network event triggers.
 
 * **IMMEDIATE SERVER DETECTION:** Altering core game methods via runtime hooks will immediately trigger modern server-side validation checks (e.g., HostGuard or native Innersloth anti-cheat). This can result in permanent IP/HWID bans.
 * **NO LIABILITY:** As defined by the **Apache License 2.0**, this software is provided on an "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND. The authors assume zero responsibility for account status or game instability.
