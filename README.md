@@ -15,7 +15,7 @@ Our Discord Servers:
 
 Tech Lounge: [Discord](https://discord.gg/rj3fWwrc8Q)
 
-AU Glitched Lobbies: [Discord](dsc.gg/AUGL)
+AU Glitched Lobbies: [Discord](https://discord.gg/AUGL)
 
 Join both of our Discords for test versions and to support us so we can continue producing more versions of this mod and continue this long lived project of AUGL.
 
