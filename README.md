@@ -23,7 +23,7 @@ This repository contains advanced BepInEx plugin features utilizing the Harmony 
 * **NO LIABILITY:** As defined by the **Apache License 2.0**, this software is provided on an "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND. The authors assume zero responsibility for account status or game instability.
 * **NON-AFFILIATION:** This project is 100% unofficial and is NOT associated, affiliated, or officially connected with Innersloth LLC.
 
-*For the full legal and technical text, see the official [DISCLAIMER.md](https://auratech0/au-glitched-lobbies/DISCLAIMERS.md) file.*
+*For the full legal and technical text, see the official [DISCLAIMER.md](https://github.com/auratech0/au-glitched-lobbies/blob/main/DISCLAIMERS.md) file.*
 </details>
 
 ---
