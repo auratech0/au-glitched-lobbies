@@ -53,3 +53,12 @@ Many things, like 2 custom gamemodes (Shift And Seek and 0cd Shields), platform 
 Glitched Among Us servers forget your level. In a glitch lobby, the server shows level 1, but your true level is higher, for example 100. This mismatch changes how the server counts your level gain. When the server tries to raise your level from 1 to 2, it uses your true level instead. The server raises your level from 100 to 101. This is how players raise their level past 100.
 
 Each lobby has a code. The last four letters of this code identify the server. Check these four letters against a list of glitch codes on [this](https://augl.net) website. This check tells you if your server is glitched. For example, assume code XYZW is a glitch code. Lobby ABXYZW ends in XYZW, hence this lobby would be glitched.
+
+# Why does my game crash when I also have other mods?
+AUGL Mod has **partial** support for other mods. High Modification mods (like EHR, SuperNewRoles etc.) *may* or *may****not*** be supported. Mods will get tested and support for them will be added. Currently we only support SickoMenu and MalumMenu. We want to have support along with other mods so we try our best to try our best to bring **stable** support and not broken pieces of code. BepInEx mods generally *should* be compatible but other mods written in C++ and not using BepInEx but special injection methods may *not* be compatible. SickoMenu and MalumMenu are tested to be fully compatible though.
+
+# Does this mod have an anti-cheat?
+We are working on it! But note that the anti-cheat may cancel some of our semi-hacking and trolling features. We currently work hard in bringing a **stable** anti-cheat like the one from BetterAmongUs.
+
+# I'm gonna report you to Innersloth for crashing their servers!!! 🤓
+We do **not**
