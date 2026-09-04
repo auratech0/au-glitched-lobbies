@@ -61,4 +61,4 @@ AUGL Mod has **partial** support for other mods. High Modification mods (like EH
 We are working on it! But note that the anti-cheat may cancel some of our semi-hacking and trolling features. We currently work hard in bringing a **stable** anti-cheat like the one from BetterAmongUs.
 
 # I'm gonna report you to Innersloth for crashing their servers!!! 🤓
-We do **not**
+We do **not** crash Innersloth's servers. We just have a bot which continuously creates, starts and ends lobbies in all 3 official regions and checks if they are glitched. We do **NOT** crash them and this is all legal. And yeah, this is based on dumb*ss who spreaded false info to Innersloth support and their Discord Server, initially *risking* our accounts to get banned.
