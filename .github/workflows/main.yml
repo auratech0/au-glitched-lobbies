@@ -4,16 +4,16 @@ on:
   push:
     branches:
       - main
-    tags:
-      - "v*"
+      - master
   pull_request:
+    branches:
+      - main
+      - master
   workflow_dispatch:
-
-permissions:
-  contents: write
 
 jobs:
   build:
+    name: Build
     runs-on: windows-latest
 
     steps:
@@ -25,7 +25,33 @@ jobs:
         with:
           dotnet-version: "6.0.x"
 
-      - name: Verify game libraries
+      - name: Download dependencies
+        shell: pwsh
+        run: |
+          $url = "https://files.skybuilder1717.ru/auglmod.zip"
+          $zip = "$env:RUNNER_TEMP\auglmod.zip"
+
+          Write-Host "Downloading dependencies..."
+          Invoke-WebRequest `
+            -Uri $url `
+            -OutFile $zip
+
+          if (!(Test-Path $zip)) {
+            throw "Failed to download dependencies."
+          }
+
+          Write-Host "Extracting dependencies..."
+
+          if (Test-Path "libs") {
+            Remove-Item "libs" -Recurse -Force
+          }
+
+          Expand-Archive `
+            -Path $zip `
+            -DestinationPath "." `
+            -Force
+
+      - name: Check dependencies
         shell: pwsh
         run: |
           $required = @(
@@ -51,19 +77,23 @@ jobs:
           $missing = @()
 
           foreach ($dll in $required) {
-            $path = Join-Path "libs" $dll
+            $path = "libs\$dll"
 
             if (!(Test-Path $path)) {
-              $missing += $path
+              $missing += $dll
             }
           }
 
           if ($missing.Count -gt 0) {
-            Write-Error "Missing required libraries:`n$($missing -join "`n")"
+            Write-Host "Missing DLLs:"
+            $missing | ForEach-Object {
+              Write-Host "  - $_"
+            }
+
             exit 1
           }
 
-          Write-Host "All required libraries are present."
+          Write-Host "All dependencies are present."
 
       - name: Restore
         run: dotnet restore AUGLMod.csproj
@@ -71,26 +101,21 @@ jobs:
       - name: Build
         run: dotnet build AUGLMod.csproj --configuration Release --no-restore
 
-      - name: Prepare package
+      - name: Prepare artifact
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path package/BepInEx/plugins/AUGL | Out-Null
+          New-Item `
+            -ItemType Directory `
+            -Force `
+            -Path "artifact/BepInEx/plugins/AUGL" | Out-Null
 
           Copy-Item `
             "bin/Release/net6.0/AUGLMod.dll" `
-            "package/BepInEx/plugins/AUGL/AUGLMod.dll"
-
-          if (Test-Path "README.md") {
-            Copy-Item "README.md" "package/README.md"
-          }
-
-          if (Test-Path "LICENSE") {
-            Copy-Item "LICENSE" "package/LICENSE"
-          }
+            "artifact/BepInEx/plugins/AUGL/AUGLMod.dll"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: AUGLMod
-          path: package/
+          path: artifact/
           if-no-files-found: error
