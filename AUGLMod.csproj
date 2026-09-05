@@ -60,5 +60,8 @@
     <Reference Include="UnityEngine.TextRenderingModule">
       <HintPath>libs\UnityEngine.TextRenderingModule.dll</HintPath>
     </Reference>
+<Reference Include="UnityEngine.Physics2DModule">
+  <HintPath>/home/al3x4nderr/Desktop/libs/UnityEngine.Physics2DModule.dll</HintPath>
+</Reference>
   </ItemGroup>
 </Project>
