@@ -32,12 +32,29 @@ jobs:
           $zip = "$env:RUNNER_TEMP\auglmod.zip"
 
           Write-Host "Downloading dependencies..."
-          Invoke-WebRequest `
-            -Uri $url `
-            -OutFile $zip
+
+          curl.exe `
+            --fail `
+            --location `
+            --retry 5 `
+            --retry-delay 2 `
+            --output "$zip" `
+            "$url"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to download dependencies. curl exit code: $LASTEXITCODE"
+          }
 
           if (!(Test-Path $zip)) {
-            throw "Failed to download dependencies."
+            throw "Downloaded file does not exist."
+          }
+
+          $size = (Get-Item $zip).Length
+
+          Write-Host "Downloaded $size bytes."
+
+          if ($size -lt 1024) {
+            throw "Downloaded file is suspiciously small."
           }
 
           Write-Host "Extracting dependencies..."
@@ -47,7 +64,7 @@ jobs:
           }
 
           Expand-Archive `
-            -Path $zip `
+            -Path "$zip" `
             -DestinationPath "." `
             -Force
 
