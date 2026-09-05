@@ -1,0 +1,67 @@
+name: Build AUGL Mod
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "6.0.x"
+
+      - name: Restore dependencies
+        run: dotnet restore AUGLMod.csproj
+
+      - name: Build
+        run: dotnet build AUGLMod.csproj --configuration Release --no-restore
+
+      - name: Prepare release files
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+
+          Copy-Item `
+            "bin/Release/net6.0/AUGLMod.dll" `
+            "dist/AUGLMod.dll"
+
+          if (Test-Path "README.md") {
+            Copy-Item "README.md" "dist/README.md"
+          }
+
+          if (Test-Path "LICENSE") {
+            Copy-Item "LICENSE" "dist/LICENSE"
+          }
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AUGLMod
+          path: dist/
+          if-no-files-found: error
+
+      - name: Create ZIP
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          Compress-Archive `
+            -Path "dist/*" `
+            -DestinationPath "AUGLMod-${{ github.ref_name }}.zip"
