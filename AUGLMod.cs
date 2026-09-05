@@ -7,6 +7,8 @@ using System.Collections.Generic;
 using System.IO;
 using System.IO.Pipes;
 using System.Net.Http;
+using System.Net.Sockets;
+using System.Runtime.InteropServices;
 using System.Reflection;
 using System.Text;
 using System.Text.Json;
@@ -15,11 +17,15 @@ using BepInEx;
 using BepInEx.Logging;
 using HarmonyLib;
 using Il2CppInterop.Runtime;
+using System.Linq;
 using UnityEngine;
+using UnityEngine.Scripting;
+using AmongUs.GameOptions;
+using InnerNet;
 
 namespace AUGLMod
 {
-    [BepInPlugin("com.al3x4nderr.auglmod", "AUGL Menu", "1.9.21")]
+    [BepInPlugin("com.al3x4nderr.auglmod", "AUGL Menu", "04.09.18")]
     [BepInProcess("Among Us.exe")]
     public class AUGLModPlugin : BasePlugin
     {
@@ -59,7 +65,6 @@ namespace AUGLMod
             
             GameOptionsPatch.ApplySafe(harmony);
             SabotageBlockPatch.ApplySafe(harmony);
-            DoorBlockPatch.ApplySafe(harmony);
             CosmeticsUnlocker.ApplySafe(harmony);
             ChatCommandsPatch.ApplySafe(harmony);
             FastStartPatch.ApplySafe(harmony);
@@ -73,6 +78,12 @@ namespace AUGLMod
             NoKillAnimationPatch.ApplySafe(harmony);
             CustomNameColorPatch.ApplySafe(harmony);
             AntiKickShieldPatch.ApplySafe(harmony);
+            AntiCheatManager.ApplySafe(harmony);
+            RoleManagerPatch.ApplySafe(harmony);
+            LobbyResetPatch.ApplySafe(harmony);
+            EndGameResetPatch.ApplySafe(harmony);
+            SetKillTimerPatch.ApplySafe(harmony);
+            DevTabManager.ApplySafe(harmony);
 
             // 4. Initialize Discord RPC (Pure C# IPC)
             DiscordRpcManager.Init();
@@ -118,7 +129,7 @@ namespace AUGLMod
         public class ModConfigData
         {
             public bool PlayStationSpoof { get; set; } = false;
-            public bool CosmeticsUnlock { get; set; } = true;
+            public bool CosmeticsUnlock { get; set; } = false;
             public bool AntiLeavePenalty { get; set; } = true;
             public bool LevelSpoofer { get; set; } = false;
             public uint CustomLevel { get; set; } = 999;
@@ -132,6 +143,9 @@ namespace AUGLMod
             public bool DiscordRPC { get; set; } = true;
             public KeyCode MenuKey { get; set; } = KeyCode.F7;
             public float CameraZoom { get; set; } = 3.0f;
+            public bool AntiCheatEnabled { get; set; } = true;
+            public List<string> Whitelist { get; set; } = new List<string>();
+            public List<string> Blacklist { get; set; } = new List<string>();
         }
 
         public static ModConfigData Current = new ModConfigData();
@@ -155,10 +169,12 @@ namespace AUGLMod
                 {
                     var json = File.ReadAllText(ConfigPath);
                     Current = JsonSerializer.Deserialize<ModConfigData>(json) ?? new ModConfigData();
-                    ApplyConfig();
                 }
             }
             catch { }
+
+            if (Current.MenuKey == KeyCode.None) Current.MenuKey = KeyCode.F7;
+            ApplyConfig();
         }
 
         public static void ApplyConfig()
@@ -176,8 +192,11 @@ namespace AUGLMod
             GhostSpeedPatch.Enabled = Current.GhostSpeedBooster;
             MeetingVoteRevealerPatch.Enabled = Current.VoteTrackerHUD;
             DiscordRpcManager.Enabled = Current.DiscordRPC;
-            AUGLMenuGUI.ToggleKey = Current.MenuKey;
+            AUGLMenuGUI.ToggleKey = Current.MenuKey != KeyCode.None ? Current.MenuKey : KeyCode.F7;
             AUGLMenuGUI.TargetZoom = Current.CameraZoom;
+            AntiCheatManager.Enabled = Current.AntiCheatEnabled;
+            AntiCheatManager.Whitelist = Current.Whitelist ?? new List<string>();
+            AntiCheatManager.Blacklist = Current.Blacklist ?? new List<string>();
         }
     }
 
@@ -185,32 +204,68 @@ namespace AUGLMod
     public class GlitchedCodeResponse
     {
         public string Code { get; set; }
+        public string Region { get; set; }
         public bool Glitched { get; set; }
+        public bool Dormant { get; set; }
         public int Port { get; set; }
+    }
+
+    public class GlitchedStatsResponse
+    {
+        public int Glitched { get; set; }
+        public int Total_Codes { get; set; }
+        public int CodesPerMin { get; set; }
     }
 
     public static class AUGLApiClient
     {
         private static readonly HttpClient Client = new HttpClient();
-        private const string Endpoint = "https://api.augl.net/v1/codes";
+        private const string CodesEndpoint = "https://api.augl.net/v1/codes";
+        private const string StatsEndpoint = "https://api.augl.net/v1/stats";
 
-        public static async Task<List<GlitchedCodeResponse>> FetchCodesAsync()
+        public static async Task<(List<GlitchedCodeResponse> codes, GlitchedStatsResponse stats)> FetchDataAsync()
         {
+            var codesList = new List<GlitchedCodeResponse>();
+            var statsResp = new GlitchedStatsResponse();
+            var opts = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
+
             try
             {
-                var opts = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
-                var json = await Client.GetStringAsync(Endpoint);
-                return JsonSerializer.Deserialize<List<GlitchedCodeResponse>>(json, opts) ?? new List<GlitchedCodeResponse>();
+                var jsonCodes = await Client.GetStringAsync(CodesEndpoint);
+                codesList = JsonSerializer.Deserialize<List<GlitchedCodeResponse>>(jsonCodes, opts) ?? new List<GlitchedCodeResponse>();
             }
             catch (Exception ex)
             {
-                AUGLModPlugin.Log?.LogWarning($"API fetch warning: {ex.Message}");
-                return new List<GlitchedCodeResponse>();
+                AUGLModPlugin.Log?.LogWarning($"API codes fetch warning: {ex.Message}");
             }
+
+            try
+            {
+                var jsonStats = await Client.GetStringAsync(StatsEndpoint);
+                using (var doc = JsonDocument.Parse(jsonStats))
+                {
+                    var root = doc.RootElement;
+                    if (root.TryGetProperty("glitched", out var g)) statsResp.Glitched = g.GetInt32();
+                    if (root.TryGetProperty("total_codes", out var t)) statsResp.Total_Codes = t.GetInt32();
+                    if (root.TryGetProperty("codes/min", out var c)) statsResp.CodesPerMin = c.GetInt32();
+                }
+            }
+            catch (Exception ex)
+            {
+                AUGLModPlugin.Log?.LogWarning($"API stats fetch warning: {ex.Message}");
+            }
+
+            return (codesList, statsResp);
+        }
+
+        public static async Task<List<GlitchedCodeResponse>> FetchCodesAsync()
+        {
+            var (codes, _) = await FetchDataAsync();
+            return codes;
         }
     }
 
-    // ================= Platform Spoofing =================
+    // ================= Platform Spoofing (BeninexPlugin 1:1) =================
     public static class PlatformSpoofManager
     {
         private static Harmony _harmony;
@@ -223,7 +278,7 @@ namespace AUGLMod
             try
             {
                 _harmony = new Harmony("com.augl.spoof");
-                
+
                 var psdType = AccessTools.TypeByName("PlatformSpecificData");
                 if (psdType != null)
                 {
@@ -232,27 +287,11 @@ namespace AUGLMod
                     {
                         _harmony.Patch(serializeMethod, prefix: new HarmonyMethod(typeof(PlatformSpoofManager).GetMethod(nameof(PrefixSerialize), BindingFlags.NonPublic | BindingFlags.Static)));
                     }
-
-                    var getPlatformData = AccessTools.Method(psdType, "GetPlatformData");
-                    if (getPlatformData != null)
-                    {
-                        _harmony.Patch(getPlatformData, postfix: new HarmonyMethod(typeof(PlatformSpoofManager).GetMethod(nameof(PostfixGetPlatformData), BindingFlags.NonPublic | BindingFlags.Static)));
-                    }
-                }
-
-                var constType = AccessTools.TypeByName("Constants");
-                if (constType != null)
-                {
-                    var getPlatMethod = AccessTools.Method(constType, "GetPlatform") ?? AccessTools.Method(constType, "GetPlatformType");
-                    if (getPlatMethod != null)
-                    {
-                        _harmony.Patch(getPlatMethod, prefix: new HarmonyMethod(typeof(PlatformSpoofManager).GetMethod(nameof(PrefixGetPlatform), BindingFlags.NonPublic | BindingFlags.Static)));
-                    }
                 }
 
                 _active = true;
                 ConfigManager.Current.PlayStationSpoof = true;
-                AUGLModPlugin.Log?.LogInfo("PlayStation platform spoofing enabled (Platform ID 10).");
+                AUGLModPlugin.Log?.LogInfo("PlayStation platform spoofing enabled (Beninex 1:1).");
             }
             catch (Exception ex)
             {
@@ -273,36 +312,149 @@ namespace AUGLMod
             AUGLModPlugin.Log?.LogInfo("PlayStation platform spoofing disabled.");
         }
 
-        private static void PrefixSerialize(Il2CppSystem.Object __instance)
+        private static void PrefixSerialize(PlatformSpecificData __instance)
         {
-            if (__instance == null) return;
+            if (!_active || __instance == null) return;
             try
             {
-                ReflectionUtils.SetMemberValue(__instance, "Platform", (int)10);
-                ReflectionUtils.SetMemberValue(__instance, "platform", (int)10);
+                __instance.Platform = (Platforms)10;
+                ulong uid = 1234567890123456789UL;
+                __instance.PsnPlatformId = uid;
+                __instance.XboxPlatformId = uid;
             }
             catch { }
         }
+    }
 
-        private static void PostfixGetPlatformData(ref Il2CppSystem.Object __result)
+    // ================= Cosmetics Unlocker =================
+    public static class CosmeticsUnlocker
+    {
+        public static bool Enabled = false;
+
+        public static void ApplySafe(Harmony harmony)
         {
-            if (__result == null) return;
             try
             {
-                ReflectionUtils.SetMemberValue(__result, "Platform", (int)10);
-                ReflectionUtils.SetMemberValue(__result, "platform", (int)10);
+                var ppdType = AccessTools.TypeByName("PlayerPurchasesData");
+                if (ppdType != null)
+                {
+                    var getPurchase = AccessTools.Method(ppdType, "GetPurchase");
+                    if (getPurchase != null)
+                    {
+                        harmony.Patch(getPurchase, prefix: new HarmonyMethod(typeof(CosmeticsUnlocker).GetMethod(nameof(PrefixGetPurchase), BindingFlags.NonPublic | BindingFlags.Static)));
+                    }
+                }
+
+                var type = AccessTools.TypeByName("HatManager");
+                if (type != null)
+                {
+                    string[] boolMethods = new string[] { "CheckPurchased", "OwnsItem", "HasPurchased", "HasItem" };
+                    foreach (var mName in boolMethods)
+                    {
+                        foreach (var method in type.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static))
+                        {
+                            if (method.Name == mName && method.ReturnType == typeof(bool))
+                            {
+                                try
+                                {
+                                    harmony.Patch(method, prefix: new HarmonyMethod(typeof(CosmeticsUnlocker).GetMethod(nameof(PrefixAlwaysTrue), BindingFlags.NonPublic | BindingFlags.Static)));
+                                }
+                                catch { }
+                            }
+                        }
+                    }
+
+                    string[] listMethods = new string[] { "GetUnlockedHats", "GetUnlockedSkins", "GetUnlockedPets", "GetUnlockedVisors", "GetUnlockedNameplates" };
+                    foreach (var mName in listMethods)
+                    {
+                        var m = AccessTools.Method(type, mName);
+                        if (m != null)
+                        {
+                            try
+                            {
+                                harmony.Patch(m, postfix: new HarmonyMethod(typeof(CosmeticsUnlocker).GetMethod(nameof(PostfixUnlockedList), BindingFlags.NonPublic | BindingFlags.Static)));
+                            }
+                            catch { }
+                        }
+                    }
+                }
+
+                AUGLModPlugin.Log?.LogInfo("CosmeticsUnlocker applied.");
             }
-            catch { }
+            catch (Exception ex)
+            {
+                AUGLModPlugin.Log?.LogWarning($"CosmeticsUnlocker error: {ex.Message}");
+            }
         }
 
-        private static bool PrefixGetPlatform(ref Il2CppSystem.Object __result)
+        private static bool PrefixGetPurchase(string itemKey, string bundleKey, ref bool __result)
         {
+            if (!Enabled) return true;
             try
             {
-                __result = (Il2CppSystem.Object)(object)(int)10;
-                return false;
+                if (DestroyableSingleton<CosmicubeManager>.InstanceExists)
+                {
+                    CosmicubeManager manager = DestroyableSingleton<CosmicubeManager>.Instance;
+                    if (manager != null && manager.allCubes != null)
+                    {
+                        foreach (CosmicubeData cube in manager.allCubes)
+                        {
+                            if (cube == null) continue;
+                            string[] ids = { cube.ProdId, cube.productId, cube.podId };
+                            foreach (string id in ids)
+                            {
+                                if (string.IsNullOrWhiteSpace(id)) continue;
+                                if (string.Equals(itemKey, id, StringComparison.OrdinalIgnoreCase) ||
+                                    string.Equals(bundleKey, id, StringComparison.OrdinalIgnoreCase))
+                                {
+                                    __result = true;
+                                    return false;
+                                }
+                            }
+                        }
+                    }
+                }
             }
-            catch { return true; }
+            catch { }
+
+            __result = true;
+            return false;
+        }
+
+        private static bool PrefixAlwaysTrue(ref bool __result)
+        {
+            if (!Enabled) return true;
+            __result = true;
+            return false;
+        }
+
+        private static void PostfixUnlockedList(MethodBase __originalMethod, ref Il2CppSystem.Object __result)
+        {
+            if (!Enabled || __result == null) return;
+            try
+            {
+                var hmType = AccessTools.TypeByName("HatManager");
+                var instProp = hmType?.GetProperty("Instance");
+                var hm = instProp?.GetValue(null);
+                if (hm == null) return;
+
+                string allFieldName = null;
+                if (__originalMethod.Name.Contains("Hat")) allFieldName = "allHats";
+                else if (__originalMethod.Name.Contains("Skin")) allFieldName = "allSkins";
+                else if (__originalMethod.Name.Contains("Pet")) allFieldName = "allPets";
+                else if (__originalMethod.Name.Contains("Visor")) allFieldName = "allVisors";
+                else if (__originalMethod.Name.Contains("Nameplate")) allFieldName = "allNamePlates";
+
+                if (allFieldName != null)
+                {
+                    var allList = ReflectionUtils.GetMemberValue(hm, allFieldName);
+                    if (allList != null)
+                    {
+                        __result = allList as Il2CppSystem.Object ?? __result;
+                    }
+                }
+            }
+            catch { }
         }
     }
 
@@ -315,19 +467,34 @@ namespace AUGLMod
         {
             try
             {
-                var statsType = AccessTools.TypeByName("StatsManager");
-                if (statsType == null) return;
-
-                string[] penaltyMethods = new string[] { "get_BanMinutesLeft", "get_BanMinutes", "get_AmBanned" };
-                foreach (var mName in penaltyMethods)
+                var banDataType = AccessTools.TypeByName("PlayerBanData");
+                if (banDataType != null)
                 {
-                    var m = AccessTools.Method(statsType, mName);
-                    if (m != null)
+                    var banPointsProp = AccessTools.Property(banDataType, "BanPoints");
+                    var setter = banPointsProp?.GetSetMethod();
+                    if (setter != null)
                     {
-                        harmony.Patch(m, prefix: new HarmonyMethod(typeof(AntiLeavePenaltyPatch).GetMethod(nameof(PrefixBypass), BindingFlags.NonPublic | BindingFlags.Static)));
+                        harmony.Patch(setter, prefix: new HarmonyMethod(typeof(AntiLeavePenaltyPatch).GetMethod(nameof(PrefixSetBanPoints), BindingFlags.NonPublic | BindingFlags.Static)));
+                    }
+
+                    var banMins = AccessTools.Method(banDataType, "get_BanMinutesLeft");
+                    if (banMins != null)
+                    {
+                        harmony.Patch(banMins, prefix: new HarmonyMethod(typeof(AntiLeavePenaltyPatch).GetMethod(nameof(PrefixBanMinutesLeft), BindingFlags.NonPublic | BindingFlags.Static)));
                     }
                 }
-                AUGLModPlugin.Log?.LogInfo("AntiLeavePenaltyPatch applied.");
+
+                var accountType = AccessTools.TypeByName("AccountManager");
+                if (accountType != null)
+                {
+                    var canPlay = AccessTools.Method(accountType, "CanPlayOnline");
+                    if (canPlay != null)
+                    {
+                        harmony.Patch(canPlay, prefix: new HarmonyMethod(typeof(AntiLeavePenaltyPatch).GetMethod(nameof(PrefixCanPlayOnline), BindingFlags.NonPublic | BindingFlags.Static)));
+                    }
+                }
+
+                AUGLModPlugin.Log?.LogInfo("AntiLeavePenaltyPatch applied (BeninexPlugin 1:1).");
             }
             catch (Exception ex)
             {
@@ -335,23 +502,32 @@ namespace AUGLMod
             }
         }
 
-        private static bool PrefixBypass(MethodBase __originalMethod, ref Il2CppSystem.Object __result)
+        private static bool PrefixSetBanPoints(ref float value)
         {
             if (!Enabled) return true;
             try
             {
-                if (__originalMethod.Name.Contains("AmBanned"))
-                {
-                    __result = (Il2CppSystem.Object)(object)false;
-                    return false;
-                }
-                else
-                {
-                    __result = (Il2CppSystem.Object)(object)0;
-                    return false;
-                }
+                if (AmongUsClient.Instance == null || AmongUsClient.Instance.NetworkMode != NetworkModes.OnlineGame)
+                    return true;
             }
-            catch { return true; }
+            catch { }
+
+            value = 0f;
+            return false;
+        }
+
+        private static bool PrefixBanMinutesLeft(ref int __result)
+        {
+            if (!Enabled) return true;
+            __result = 0;
+            return false;
+        }
+
+        private static bool PrefixCanPlayOnline(ref bool __result)
+        {
+            if (!Enabled) return true;
+            __result = true;
+            return false;
         }
     }
 
@@ -471,12 +647,9 @@ namespace AUGLMod
                 var myPlayer = myPlayerProp?.GetValue(__instance);
                 if (myPlayer == null) return;
 
-                var dataProp = AccessTools.Property(myPlayer.GetType(), "Data");
-                var data = dataProp?.GetValue(myPlayer);
-                if (data == null) return;
+                if (!(myPlayer is PlayerControl pc) || pc.Data == null) return;
 
-                var isDeadField = AccessTools.Field(data.GetType(), "IsDead");
-                bool isDead = (bool)(isDeadField?.GetValue(data) ?? false);
+                bool isDead = pc.Data.IsDead;
 
                 if (isDead)
                 {
@@ -499,34 +672,7 @@ namespace AUGLMod
 
         public static void ApplySafe(Harmony harmony)
         {
-            try
-            {
-                var pcType = AccessTools.TypeByName("PlayerPhysics");
-                if (pcType != null)
-                {
-                    var handleMove = AccessTools.Method(pcType, "HandleMovement");
-                    if (handleMove != null)
-                    {
-                        harmony.Patch(handleMove, prefix: new HarmonyMethod(typeof(NoClipPatch).GetMethod(nameof(PrefixHandleMovement), BindingFlags.NonPublic | BindingFlags.Static)));
-                    }
-                }
-            }
-            catch { }
-        }
-
-        private static void PrefixHandleMovement(Il2CppSystem.Object __instance)
-        {
-            if (!Enabled || __instance == null) return;
-            try
-            {
-                var colliderProp = AccessTools.Property(__instance.GetType(), "Collider");
-                var collider = colliderProp?.GetValue(__instance);
-                if (collider != null)
-                {
-                    ReflectionUtils.SetMemberValue(collider, "enabled", false);
-                }
-            }
-            catch { }
+            // Driven directly per-frame in AUGLMenuBehaviour.Update
         }
     }
 
@@ -539,28 +685,45 @@ namespace AUGLMod
         {
             try
             {
-                var lsType = AccessTools.TypeByName("LightSource");
-                if (lsType != null)
+                var ssType = AccessTools.TypeByName("ShipStatus");
+                if (ssType != null)
                 {
-                    var update = AccessTools.Method(lsType, "Update");
-                    if (update != null)
+                    var calcLight = AccessTools.Method(ssType, "CalculateLightRadius");
+                    if (calcLight != null)
                     {
-                        harmony.Patch(update, postfix: new HarmonyMethod(typeof(MaxVisionPatch).GetMethod(nameof(PostfixLightUpdate), BindingFlags.NonPublic | BindingFlags.Static)));
+                        harmony.Patch(calcLight, prefix: new HarmonyMethod(typeof(MaxVisionPatch).GetMethod(nameof(PrefixCalculateLightRadius), BindingFlags.NonPublic | BindingFlags.Static)));
                     }
                 }
             }
             catch { }
         }
 
-        private static void PostfixLightUpdate(Il2CppSystem.Object __instance)
+        private static bool PrefixCalculateLightRadius(ref float __result)
         {
-            if (!Enabled || __instance == null) return;
+            if (!Enabled)
+            {
+                try
+                {
+                    if (HudManager.Instance != null && HudManager.Instance.ShadowQuad != null)
+                    {
+                        HudManager.Instance.ShadowQuad.gameObject.SetActive(true);
+                    }
+                }
+                catch { }
+                return true;
+            }
+
             try
             {
-                ReflectionUtils.SetMemberValue(__instance, "viewDistance", 50f);
-                ReflectionUtils.SetMemberValue(__instance, "ViewDistance", 50f);
+                if (HudManager.Instance != null && HudManager.Instance.ShadowQuad != null)
+                {
+                    HudManager.Instance.ShadowQuad.gameObject.SetActive(false);
+                }
             }
             catch { }
+
+            __result = 1000f;
+            return false;
         }
     }
 
@@ -568,6 +731,7 @@ namespace AUGLMod
     public static class DeadRoleRevealerPatch
     {
         public static bool Enabled = true;
+        private static FieldInfo _nameTextCache;
 
         public static void ApplySafe(Harmony harmony)
         {
@@ -591,33 +755,22 @@ namespace AUGLMod
             if (!Enabled || __instance == null) return;
             try
             {
-                var localPlayerProp = AccessTools.Property(AccessTools.TypeByName("PlayerControl"), "LocalPlayer");
-                var localPlayer = localPlayerProp?.GetValue(null);
-                if (localPlayer == null) return;
+                var localPlayer = PlayerControl.LocalPlayer;
+                if (localPlayer == null || localPlayer.Data == null) return;
 
-                var localDataProp = AccessTools.Property(localPlayer.GetType(), "Data");
-                var localData = localDataProp?.GetValue(localPlayer);
-                if (localData == null) return;
+                bool isDead = localPlayer.Data.IsDead;
 
-                var localIsDead = ReflectionUtils.GetMemberValue(localData, "IsDead");
-                bool isDead = (bool)(localIsDead ?? false);
-
-                if (isDead)
+                if (isDead && __instance is PlayerControl targetPc && targetPc.Data != null)
                 {
-                    var pDataProp = AccessTools.Property(__instance.GetType(), "Data");
-                    var pData = pDataProp?.GetValue(__instance);
-                    if (pData != null)
+                    bool isImp = targetPc.Data.Role?.IsImpostor ?? false;
+                    if (isImp)
                     {
-                        var isImpVal = ReflectionUtils.GetMemberValue(pData, "IsImpostor");
-                        bool isImp = (bool)(isImpVal ?? false);
-
-                        if (isImp)
+                        if (_nameTextCache == null) _nameTextCache = AccessTools.Field(targetPc.GetType(), "nameText") ?? AccessTools.Field(targetPc.GetType(), "NameText");
+                        var nameTextObj = _nameTextCache?.GetValue(targetPc);
+                        if (nameTextObj != null)
                         {
-                            var nameTextProp = AccessTools.Field(__instance.GetType(), "nameText")?.GetValue(__instance);
-                            if (nameTextProp != null)
-                            {
-                                ReflectionUtils.SetMemberValue(nameTextProp, "color", Color.red);
-                            }
+                            ReflectionUtils.SetMemberValue(nameTextObj, "color", Color.red);
+                            ReflectionUtils.SetMemberValue(nameTextObj, "color32", (Color32)Color.red);
                         }
                     }
                 }
@@ -638,11 +791,18 @@ namespace AUGLMod
                 var koType = AccessTools.TypeByName("KillOverlay");
                 if (koType != null)
                 {
-                    var showKill = AccessTools.Method(koType, "ShowKillAnimation");
-                    if (showKill != null)
+                    foreach (var m in koType.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static))
                     {
-                        harmony.Patch(showKill, prefix: new HarmonyMethod(typeof(NoKillAnimationPatch).GetMethod(nameof(PrefixShowKill), BindingFlags.NonPublic | BindingFlags.Static)));
+                        if (m.Name == "ShowKillAnimation")
+                        {
+                            try
+                            {
+                                harmony.Patch(m, prefix: new HarmonyMethod(typeof(NoKillAnimationPatch).GetMethod(nameof(PrefixShowKill), BindingFlags.NonPublic | BindingFlags.Static)));
+                            }
+                            catch { }
+                        }
                     }
+                    AUGLModPlugin.Log?.LogInfo("NoKillAnimationPatch applied.");
                 }
             }
             catch { }
@@ -673,6 +833,16 @@ namespace AUGLMod
                         harmony.Patch(checkName, prefix: new HarmonyMethod(typeof(CustomNameColorPatch).GetMethod(nameof(PrefixCheckName), BindingFlags.NonPublic | BindingFlags.Static)));
                     }
                 }
+
+                var pcType = AccessTools.TypeByName("PlayerControl");
+                if (pcType != null)
+                {
+                    var setPlayerName = AccessTools.Method(pcType, "RpcSetName") ?? AccessTools.Method(pcType, "CmdCheckName");
+                    if (setPlayerName != null)
+                    {
+                        harmony.Patch(setPlayerName, prefix: new HarmonyMethod(typeof(CustomNameColorPatch).GetMethod(nameof(PrefixCheckName), BindingFlags.NonPublic | BindingFlags.Static)));
+                    }
+                }
             }
             catch { }
         }
@@ -700,10 +870,16 @@ namespace AUGLMod
                 var incType = AccessTools.TypeByName("InnerNetClient");
                 if (incType != null)
                 {
-                    var handleKick = AccessTools.Method(incType, "HandleDisconnect");
-                    if (handleKick != null)
+                    foreach (var m in incType.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance))
                     {
-                        harmony.Patch(handleKick, prefix: new HarmonyMethod(typeof(AntiKickShieldPatch).GetMethod(nameof(PrefixHandleDisconnect), BindingFlags.NonPublic | BindingFlags.Static)));
+                        if (m.Name == "HandleDisconnect")
+                        {
+                            try
+                            {
+                                harmony.Patch(m, prefix: new HarmonyMethod(typeof(AntiKickShieldPatch).GetMethod(nameof(PrefixHandleDisconnect), BindingFlags.NonPublic | BindingFlags.Static)));
+                            }
+                            catch { }
+                        }
                     }
                 }
             }
@@ -712,11 +888,16 @@ namespace AUGLMod
 
         private static bool PrefixHandleDisconnect(Il2CppSystem.Object reason, string customReason)
         {
-            if (Enabled && customReason != null && customReason.ToLower().Contains("kicked"))
+            if (!Enabled) return true;
+            try
             {
-                AUGLModPlugin.Log?.LogInfo("AntiKickShield blocked an unauthorized kick attempt!");
-                return false;
+                if (!string.IsNullOrEmpty(customReason) && customReason.ToLower().Contains("kicked"))
+                {
+                    AUGLModPlugin.Log?.LogInfo("AntiKickShield blocked kick attempt.");
+                    return false;
+                }
             }
+            catch { }
             return true;
         }
     }
@@ -725,8 +906,9 @@ namespace AUGLMod
     public static class DiscordRpcManager
     {
         public static bool Enabled = true;
-        private static NamedPipeClientStream _pipe;
+        private static Stream _stream;
         private static bool _connected = false;
+        private static bool _connecting = false;
         private static float _lastUpdateTime = 0f;
         private const string ClientId = "1543635619476013086";
 
@@ -744,50 +926,104 @@ namespace AUGLMod
 
         private static void ConnectPipe()
         {
+            if (_connecting) return;
+            _connecting = true;
             try
             {
+                // 1. Try Windows / Standard Named Pipe first
                 for (int i = 0; i < 10; i++)
                 {
-                    string pipeName = Environment.OSVersion.Platform == PlatformID.Unix
-                        ? Path.Combine(Environment.GetEnvironmentVariable("XDG_RUNTIME_DIR") ?? "/tmp", $"discord-ipc-{i}")
-                        : $"discord-ipc-{i}";
-
-                    if (Environment.OSVersion.Platform == PlatformID.Unix && !File.Exists(pipeName)) continue;
-
-                    _pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut);
-                    _pipe.Connect(500);
-                    if (_pipe.IsConnected)
+                    try
                     {
-                        _connected = true;
-                        SendHandshake();
-                        AUGLModPlugin.Log?.LogInfo($"Discord RPC connected via pipe {i}.");
-                        break;
+                        var np = new NamedPipeClientStream(".", $"discord-ipc-{i}", PipeDirection.InOut);
+                        np.Connect(30);
+                        if (np.IsConnected)
+                        {
+                            _stream = np;
+                            _connected = true;
+                            SendHandshake();
+                            AUGLModPlugin.Log?.LogInfo($"Discord RPC connected via Windows NamedPipe {i}.");
+                            return;
+                        }
+                    }
+                    catch { }
+                }
+
+                // 2. Try Unix Domain Sockets for Linux / Steam Deck / Flatpak / Wine / Proton
+                string xdgRuntime = Environment.GetEnvironmentVariable("XDG_RUNTIME_DIR");
+                string[] searchDirs = new string[]
+                {
+                    xdgRuntime,
+                    "/tmp",
+                    !string.IsNullOrEmpty(xdgRuntime) ? Path.Combine(xdgRuntime, "app", "com.discordapp.Discord") : null,
+                    "/tmp/app/com.discordapp.Discord"
+                };
+
+                foreach (var dir in searchDirs)
+                {
+                    if (string.IsNullOrEmpty(dir) || !Directory.Exists(dir)) continue;
+
+                    for (int i = 0; i < 10; i++)
+                    {
+                        string socketPath = Path.Combine(dir, $"discord-ipc-{i}");
+                        if (!File.Exists(socketPath)) continue;
+
+                        try
+                        {
+                            var np = new NamedPipeClientStream(".", socketPath, PipeDirection.InOut);
+                            np.Connect(30);
+                            if (np.IsConnected)
+                            {
+                                _stream = np;
+                                _connected = true;
+                                SendHandshake();
+                                AUGLModPlugin.Log?.LogInfo($"Discord RPC connected via Unix Pipe at {socketPath}.");
+                                return;
+                            }
+                        }
+                        catch { }
+
+                        try
+                        {
+                            var socket = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
+                            socket.Connect(new UnixDomainSocketEndPoint(socketPath));
+                            if (socket.Connected)
+                            {
+                                _stream = new NetworkStream(socket, true);
+                                _connected = true;
+                                SendHandshake();
+                                AUGLModPlugin.Log?.LogInfo($"Discord RPC connected via Unix Socket at {socketPath}.");
+                                return;
+                            }
+                        }
+                        catch { }
                     }
                 }
             }
             catch { _connected = false; }
+            finally { _connecting = false; }
         }
 
         private static void SendHandshake()
         {
             try
             {
-                if (!_connected || _pipe == null) return;
+                if (!_connected || _stream == null) return;
                 string json = $"{{\"v\":1,\"client_id\":\"{ClientId}\"}}";
                 byte[] body = Encoding.UTF8.GetBytes(json);
                 byte[] header = new byte[8];
                 BitConverter.GetBytes(0).CopyTo(header, 0);
                 BitConverter.GetBytes(body.Length).CopyTo(header, 4);
-                _pipe.Write(header, 0, 8);
-                _pipe.Write(body, 0, body.Length);
-                _pipe.Flush();
+                _stream.Write(header, 0, 8);
+                _stream.Write(body, 0, body.Length);
+                _stream.Flush();
             }
             catch { _connected = false; }
         }
 
         public static void UpdatePresence(string details, string state, string partyCode = null, int partySize = 0, int partyMax = 15)
         {
-            if (!Enabled || !_connected || _pipe == null) return;
+            if (!Enabled || !_connected || _stream == null) return;
             try
             {
                 var presenceObj = new
@@ -803,7 +1039,7 @@ namespace AUGLMod
                             assets = new
                             {
                                 large_image = "among_us_logo",
-                                large_text = "AUGL Menu v1.9.21"
+                                large_text = "AUGL Menu 04.09.18"
                             },
                             party = string.IsNullOrEmpty(partyCode) ? null : new { id = partyCode, size = new int[] { partySize, partyMax } }
                         }
@@ -816,9 +1052,9 @@ namespace AUGLMod
                 byte[] header = new byte[8];
                 BitConverter.GetBytes(1).CopyTo(header, 0);
                 BitConverter.GetBytes(body.Length).CopyTo(header, 4);
-                _pipe.Write(header, 0, 8);
-                _pipe.Write(body, 0, body.Length);
-                _pipe.Flush();
+                _stream.Write(header, 0, 8);
+                _stream.Write(body, 0, body.Length);
+                _stream.Flush();
             }
             catch
             {
@@ -832,7 +1068,7 @@ namespace AUGLMod
             if (Time.time - _lastUpdateTime < 5f) return;
             _lastUpdateTime = Time.time;
 
-            if (!_connected)
+            if (!_connected && !_connecting)
             {
                 _ = Task.Run(() => ConnectPipe());
                 return;
@@ -850,92 +1086,6 @@ namespace AUGLMod
             {
                 UpdatePresence("AUGL Mod Active", "Browsing Lobbies");
             }
-        }
-    }
-
-    // ================= Cosmetics Unlocker =================
-    public static class CosmeticsUnlocker
-    {
-        public static bool Enabled = true;
-
-        public static void ApplySafe(Harmony harmony)
-        {
-            try
-            {
-                var type = AccessTools.TypeByName("HatManager");
-                if (type == null) return;
-
-                string[] boolMethods = new string[] { "CheckPurchased", "OwnsItem", "HasPurchased", "HasItem" };
-                foreach (var mName in boolMethods)
-                {
-                    foreach (var method in type.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static))
-                    {
-                        if (method.Name == mName && method.ReturnType == typeof(bool))
-                        {
-                            try
-                            {
-                                harmony.Patch(method, prefix: new HarmonyMethod(typeof(CosmeticsUnlocker).GetMethod(nameof(PrefixAlwaysTrue), BindingFlags.NonPublic | BindingFlags.Static)));
-                            }
-                            catch { }
-                        }
-                    }
-                }
-
-                string[] listMethods = new string[] { "GetUnlockedHats", "GetUnlockedSkins", "GetUnlockedPets", "GetUnlockedVisors", "GetUnlockedNameplates" };
-                foreach (var mName in listMethods)
-                {
-                    var m = AccessTools.Method(type, mName);
-                    if (m != null)
-                    {
-                        try
-                        {
-                            harmony.Patch(m, postfix: new HarmonyMethod(typeof(CosmeticsUnlocker).GetMethod(nameof(PostfixUnlockedList), BindingFlags.NonPublic | BindingFlags.Static)));
-                        }
-                        catch { }
-                    }
-                }
-                AUGLModPlugin.Log?.LogInfo("CosmeticsUnlocker patches applied.");
-            }
-            catch (Exception ex)
-            {
-                AUGLModPlugin.Log?.LogWarning($"CosmeticsUnlocker setup warning: {ex.Message}");
-            }
-        }
-
-        private static bool PrefixAlwaysTrue(ref bool __result)
-        {
-            if (!Enabled) return true;
-            __result = true;
-            return false;
-        }
-
-        private static void PostfixUnlockedList(MethodBase __originalMethod, ref Il2CppSystem.Object __result)
-        {
-            if (!Enabled || __result == null) return;
-            try
-            {
-                var hmType = AccessTools.TypeByName("HatManager");
-                var instProp = hmType?.GetProperty("Instance");
-                var hm = instProp?.GetValue(null);
-                if (hm == null) return;
-
-                string allFieldName = null;
-                if (__originalMethod.Name.Contains("Hat")) allFieldName = "allHats";
-                else if (__originalMethod.Name.Contains("Skin")) allFieldName = "allSkins";
-                else if (__originalMethod.Name.Contains("Pet")) allFieldName = "allPets";
-                else if (__originalMethod.Name.Contains("Visor")) allFieldName = "allVisors";
-                else if (__originalMethod.Name.Contains("Nameplate")) allFieldName = "allNamePlates";
-
-                if (allFieldName != null)
-                {
-                    var allList = ReflectionUtils.GetMemberValue(hm, allFieldName);
-                    if (allList != null)
-                    {
-                        __result = allList as Il2CppSystem.Object ?? __result;
-                    }
-                }
-            }
-            catch { }
         }
     }
 
@@ -1006,7 +1156,7 @@ namespace AUGLMod
                 switch (cmd)
                 {
                     case "/help":
-                        ShowChatMsg("Commands: /codes, /glitch, /autojoin, /spoof, /level, /start, /endgame, /endmeeting, /kick, /ban, /tpout, /tpin, /color, /menu, /help");
+                        ShowChatMsg("Commands: /codes, /glitch, /spoof, /level, /start, /endgame, /endmeeting, /kick, /ban, /tpout, /tpin, /color, /menu, /help");
                         break;
                     case "/menu":
                     case "/gui":
@@ -1016,11 +1166,6 @@ namespace AUGLMod
                     case "/spoof":
                         if (PlatformSpoofManager.IsActive) { PlatformSpoofManager.Disable(); ShowChatMsg("PlayStation Spoof: <color=#FF4444>OFF</color>"); }
                         else { PlatformSpoofManager.Enable(); ShowChatMsg("PlayStation Spoof: <color=#00FF66>ON (PS)</color>"); }
-                        break;
-                    case "/autojoin":
-                    case "/join":
-                        AUGLMenuGUI.AutoJoinGlitchedLobby();
-                        ShowChatMsg("Connecting to active glitched lobby...");
                         break;
                     case "/glitch":
                     case "/check":
@@ -1075,12 +1220,25 @@ namespace AUGLMod
                 var localPlayer = localPlayerProp?.GetValue(null);
                 if (localPlayer == null) return;
 
+                var transformProp = AccessTools.Property(localPlayer.GetType(), "transform");
+                var transform = transformProp?.GetValue(localPlayer);
+                if (transform != null)
+                {
+                    ReflectionUtils.SetMemberValue(transform, "position", new Vector3(pos.x, pos.y, -1f));
+                }
+
                 var netTransformProp = AccessTools.Property(localPlayer.GetType(), "NetTransform");
                 var netTransform = netTransformProp?.GetValue(localPlayer);
-                if (netTransform == null) return;
+                if (netTransform != null)
+                {
+                    var rpcSnap = AccessTools.Method(netTransform.GetType(), "RpcSnapTo", new Type[] { typeof(Vector2) })
+                                ?? AccessTools.Method(netTransform.GetType(), "RpcSnapTo");
+                    rpcSnap?.Invoke(netTransform, new object[] { pos });
 
-                var snapMethod = AccessTools.Method(netTransform.GetType(), "SnapTo");
-                snapMethod?.Invoke(netTransform, new object[] { pos, (ushort)0 });
+                    var snapMethod = AccessTools.Method(netTransform.GetType(), "SnapTo", new Type[] { typeof(Vector2), typeof(ushort) })
+                                  ?? AccessTools.Method(netTransform.GetType(), "SnapTo");
+                    snapMethod?.Invoke(netTransform, new object[] { pos, (ushort)0 });
+                }
             }
             catch { }
         }
@@ -1089,12 +1247,10 @@ namespace AUGLMod
         {
             try
             {
-                var localPlayerProp = AccessTools.Property(AccessTools.TypeByName("PlayerControl"), "LocalPlayer");
-                var localPlayer = localPlayerProp?.GetValue(null);
-                if (localPlayer == null) return;
-
-                var rpcSetColor = AccessTools.Method(localPlayer.GetType(), "RpcSetColor");
-                rpcSetColor?.Invoke(localPlayer, new object[] { colorId });
+                var lp = PlayerControl.LocalPlayer;
+                if (lp == null) return;
+                lp.CmdCheckColor(colorId);
+                lp.RpcSetColor(colorId);
             }
             catch { }
         }
@@ -1134,25 +1290,36 @@ namespace AUGLMod
         {
             try
             {
-                var gomType = AccessTools.TypeByName("GameOptionsManager");
-                var gomInstProp = gomType?.GetProperty("Instance");
-                var gom = gomInstProp?.GetValue(null);
-                var currOptProp = gomType?.GetProperty("CurrentGameOptions");
-                var options = currOptProp?.GetValue(gom);
+                var gom = GameOptionsManager.Instance;
+                var options = gom?.CurrentGameOptions;
                 if (options == null) return;
 
-                var setFloat = AccessTools.Method(options.GetType(), "SetFloat", new Type[] { typeof(int), typeof(float) })
-                            ?? AccessTools.Method(options.GetType(), "SetFloat");
+                ReflectionUtils.SetMemberValue(options, "PlayerSpeedMod", PlayerSpeed);
+                ReflectionUtils.SetMemberValue(options, "CrewLightMod", CrewLight);
+                ReflectionUtils.SetMemberValue(options, "ImpostorLightMod", ImpLight);
 
+                var setFloat = options.GetType().GetMethods()
+                    .FirstOrDefault(m => m.Name == "SetFloat" && m.GetParameters().Length == 2
+                        && m.GetParameters()[0].ParameterType != typeof(int));
+                if (setFloat == null)
+                {
+                    setFloat = AccessTools.Method(options.GetType(), "SetFloat");
+                }
                 if (setFloat != null)
                 {
-                    setFloat.Invoke(options, new object[] { 2, PlayerSpeed });
-                    setFloat.Invoke(options, new object[] { 3, CrewLight });
-                    setFloat.Invoke(options, new object[] { 4, ImpLight });
+                    var ps = setFloat.GetParameters();
+                    if (ps.Length == 2)
+                    {
+                        object speed2 = Enum.ToObject(ps[0].ParameterType, 2);
+                        object crew3 = Enum.ToObject(ps[0].ParameterType, 3);
+                        object imp4 = Enum.ToObject(ps[0].ParameterType, 4);
+                        try { setFloat.Invoke(options, new object[] { speed2, PlayerSpeed }); } catch { }
+                        try { setFloat.Invoke(options, new object[] { crew3, CrewLight }); } catch { }
+                        try { setFloat.Invoke(options, new object[] { imp4, ImpLight }); } catch { }
+                    }
                 }
 
-                var syncMethod = AccessTools.Method(gomType, "SyncGameOptions") ?? AccessTools.Method(gomType, "Dirty");
-                syncMethod?.Invoke(gom, null);
+                SyncCurrentOptions();
                 AUGLModPlugin.Log?.LogInfo($"Host settings synced: Speed={PlayerSpeed}x, CrewLight={CrewLight}x, ImpLight={ImpLight}x");
             }
             catch (Exception ex)
@@ -1161,19 +1328,580 @@ namespace AUGLMod
             }
         }
 
-        public static void TriggerRemoteDoor(int systemType, bool close)
+        public static void SetMaxPlayers25()
         {
             try
             {
-                var shipStatusType = AccessTools.TypeByName("ShipStatus");
-                var ssInst = shipStatusType?.GetProperty("Instance")?.GetValue(null);
-                if (ssInst == null) return;
+                var gom = GameOptionsManager.Instance;
+                if (gom == null) return;
+                var options = gom.CurrentGameOptions;
+                if (options == null) return;
 
-                var rpcClose = AccessTools.Method(shipStatusType, "RpcCloseDoorsOfType");
-                rpcClose?.Invoke(ssInst, new object[] { systemType });
-                AUGLModPlugin.Log?.LogInfo($"Remote door action triggered for system {systemType}.");
+                var maxPlayersProp = AccessTools.Property(options.GetType(), "MaxPlayers");
+                if (maxPlayersProp != null)
+                {
+                    maxPlayersProp.SetValue(options, 25);
+                }
+                else
+                {
+                    var setInt = AccessTools.Method(options.GetType(), "SetInt", new Type[] { typeof(int), typeof(int) });
+                    setInt?.Invoke(options, new object[] { 0, 25 });
+                }
+
+                SyncCurrentOptions();
+                AUGLModPlugin.Log?.LogInfo("Host QoL: Set Max Players to 25 (public vanilla compatible).");
+            }
+            catch (Exception ex)
+            {
+                AUGLModPlugin.Log?.LogWarning($"SetMaxPlayers25 error: {ex.Message}");
+            }
+        }
+
+        public static void SyncCurrentOptions()
+        {
+            try
+            {
+                var client = AmongUsClient.Instance;
+                if (client == null || !client.AmHost) return;
+
+                var gom = GameOptionsManager.Instance;
+                var options = gom?.CurrentGameOptions;
+                if (options == null) return;
+
+                try
+                {
+                    var syncMethod = AccessTools.Method(typeof(GameOptionsManager), "SyncGameOptions")
+                                  ?? AccessTools.Method(typeof(GameOptionsManager), "Dirty");
+                    syncMethod?.Invoke(gom, null);
+                }
+                catch { }
+
+                try
+                {
+                    var lp = PlayerControl.LocalPlayer;
+                    if (lp != null)
+                    {
+                        MethodInfo toBytesMethod = options.GetType().GetMethod("ToBytes", new Type[] { typeof(byte) })
+                                                ?? options.GetType().GetMethod("ToBytes", Type.EmptyTypes);
+                        object bytes = null;
+                        if (toBytesMethod != null)
+                        {
+                            var ps = toBytesMethod.GetParameters();
+                            bytes = ps.Length == 1 ? toBytesMethod.Invoke(options, new object[] { (byte)4 }) : toBytesMethod.Invoke(options, null);
+                        }
+
+                        if (bytes != null)
+                        {
+                            var rpcSync = lp.GetType().GetMethods().FirstOrDefault(m => m.Name == "RpcSyncSettings" && m.GetParameters().Length == 1);
+                            rpcSync?.Invoke(lp, new object[] { bytes });
+                        }
+                    }
+                }
+                catch { }
+            }
+            catch (Exception ex)
+            {
+                AUGLModPlugin.Log?.LogWarning($"SyncCurrentOptions error: {ex.Message}");
+            }
+        }
+    }
+
+    // ================= Anti-Cheat, Whitelist & Blacklist =================
+    public static class AntiCheatManager
+    {
+        public static bool Enabled = true;
+        public static List<string> Whitelist = new List<string>();
+        public static List<string> Blacklist = new List<string>();
+
+        public static bool IsWhitelisted(string name, string friendCode = null)
+        {
+            if (string.IsNullOrEmpty(name)) return false;
+            foreach (var w in Whitelist)
+            {
+                if (string.Equals(w.Trim(), name.Trim(), StringComparison.OrdinalIgnoreCase)) return true;
+                if (!string.IsNullOrEmpty(friendCode) && string.Equals(w.Trim(), friendCode.Trim(), StringComparison.OrdinalIgnoreCase)) return true;
+            }
+            return false;
+        }
+
+        public static bool IsBlacklisted(string name, string friendCode = null)
+        {
+            if (string.IsNullOrEmpty(name)) return false;
+            foreach (var b in Blacklist)
+            {
+                if (string.Equals(b.Trim(), name.Trim(), StringComparison.OrdinalIgnoreCase)) return true;
+                if (!string.IsNullOrEmpty(friendCode) && string.Equals(b.Trim(), friendCode.Trim(), StringComparison.OrdinalIgnoreCase)) return true;
+            }
+            return false;
+        }
+
+        public static void ApplySafe(Harmony harmony)
+        {
+            try
+            {
+                var pcType = AccessTools.TypeByName("PlayerControl");
+                if (pcType != null)
+                {
+                    var initMethod = AccessTools.Method(pcType, "Initialize");
+                    if (initMethod != null)
+                    {
+                        harmony.Patch(initMethod, postfix: new HarmonyMethod(typeof(AntiCheatManager).GetMethod(nameof(PostfixPlayerInit), BindingFlags.NonPublic | BindingFlags.Static)));
+                    }
+
+                    var murderMethod = AccessTools.Method(pcType, "MurderPlayer");
+                    if (murderMethod != null)
+                    {
+                        harmony.Patch(murderMethod, prefix: new HarmonyMethod(typeof(AntiCheatManager).GetMethod(nameof(PrefixMurderPlayer), BindingFlags.NonPublic | BindingFlags.Static)));
+                    }
+                }
+
+                var voteKickType = AccessTools.TypeByName("VoteBanSystem");
+                if (voteKickType != null)
+                {
+                    var cmdAddVote = AccessTools.Method(voteKickType, "CmdAddVote") ?? AccessTools.Method(voteKickType, "RpcAddVote");
+                    if (cmdAddVote != null)
+                    {
+                        harmony.Patch(cmdAddVote, prefix: new HarmonyMethod(typeof(AntiCheatManager).GetMethod(nameof(PrefixAddVoteKick), BindingFlags.NonPublic | BindingFlags.Static)));
+                    }
+                }
+
+                AUGLModPlugin.Log?.LogInfo("AntiCheatManager applied with Whitelist & Blacklist protection.");
+            }
+            catch (Exception ex)
+            {
+                AUGLModPlugin.Log?.LogWarning($"AntiCheatManager error: {ex.Message}");
+            }
+        }
+
+        private static bool PrefixAddVoteKick(int targetClientId)
+        {
+            if (!Enabled) return true;
+            try
+            {
+                var client = AmongUsClient.Instance;
+                if (client != null)
+                {
+                    if (targetClientId == client.HostId || targetClientId == client.ClientId)
+                    {
+                        AUGLModPlugin.Log?.LogWarning($"Blocked malicious vote kick targeting Host (client {targetClientId})!");
+                        AUGLMenuGUI.TriggerToast("Anti-Cheat: Blocked Vote Kick on Host!");
+                        return false;
+                    }
+                }
             }
             catch { }
+            return true;
+        }
+
+        private static void PostfixPlayerInit(PlayerControl __instance)
+        {
+            if (!Enabled || __instance == null || AmongUsClient.Instance == null || !AmongUsClient.Instance.AmHost) return;
+            try
+            {
+                if (__instance.Data == null) return;
+                string pName = __instance.Data.PlayerName;
+                string fc = __instance.Data.FriendCode;
+
+                if (IsWhitelisted(pName, fc))
+                {
+                    AUGLModPlugin.Log?.LogInfo($"Whitelisted friend joined: {pName}");
+                    return;
+                }
+
+                if (IsBlacklisted(pName, fc))
+                {
+                    AUGLModPlugin.Log?.LogWarning($"Auto-banning blacklisted player: {pName}");
+                    AmongUsClient.Instance.KickPlayer(__instance.OwnerId, true);
+                    AUGLMenuGUI.TriggerToast($"Banned Blacklisted Player: {pName}");
+                }
+            }
+            catch { }
+        }
+
+        private static bool PrefixMurderPlayer(PlayerControl __instance, PlayerControl target)
+        {
+            if (!Enabled || __instance == null || AmongUsClient.Instance == null || !AmongUsClient.Instance.AmHost) return true;
+            try
+            {
+                if (__instance.Data == null) return true;
+                string pName = __instance.Data.PlayerName;
+                string fc = __instance.Data.FriendCode;
+
+                if (IsWhitelisted(pName, fc)) return true;
+
+                if (!__instance.Data.Role.IsImpostor)
+                {
+                    AUGLModPlugin.Log?.LogWarning($"Illegal murder attempt blocked from non-impostor: {pName}");
+                    AmongUsClient.Instance.KickPlayer(__instance.OwnerId, false);
+                    AUGLMenuGUI.TriggerToast($"Anti-Cheat: Kicked {pName} (Illegal Kill)");
+                    return false;
+                }
+            }
+            catch { }
+            return true;
+        }
+    }
+
+    // ================= Reset & Game State Patches for Players Tab =================
+    public static class LobbyResetPatch
+    {
+        public static void ApplySafe(Harmony harmony)
+        {
+            try
+            {
+                var type = AccessTools.TypeByName("LobbyBehaviour");
+                if (type == null) return;
+                var method = AccessTools.Method(type, "Start");
+                if (method != null)
+                {
+                    harmony.Patch(method, postfix: new HarmonyMethod(typeof(LobbyResetPatch).GetMethod(nameof(Postfix), BindingFlags.NonPublic | BindingFlags.Static)));
+                }
+            }
+            catch { }
+        }
+
+        private static void Postfix()
+        {
+            PlayersTabManager.ResetAllPlayerLoops();
+        }
+    }
+
+    public static class EndGameResetPatch
+    {
+        public static void ApplySafe(Harmony harmony)
+        {
+            try
+            {
+                var type = AccessTools.TypeByName("EndGameManager");
+                if (type == null) return;
+                var method = AccessTools.Method(type, "Start");
+                if (method != null)
+                {
+                    harmony.Patch(method, postfix: new HarmonyMethod(typeof(EndGameResetPatch).GetMethod(nameof(Postfix), BindingFlags.NonPublic | BindingFlags.Static)));
+                }
+            }
+            catch { }
+        }
+
+        private static void Postfix()
+        {
+            PlayersTabManager.ResetAllPlayerLoops();
+        }
+    }
+
+    public static class SetKillTimerPatch
+    {
+        public static void ApplySafe(Harmony harmony)
+        {
+            try
+            {
+                var type = AccessTools.TypeByName("PlayerControl");
+                if (type == null) return;
+                var method = AccessTools.Method(type, "SetKillTimer");
+                if (method != null)
+                {
+                    harmony.Patch(method, prefix: new HarmonyMethod(typeof(SetKillTimerPatch).GetMethod(nameof(Prefix), BindingFlags.NonPublic | BindingFlags.Static)));
+                }
+            }
+            catch { }
+        }
+
+        private static void Prefix(PlayerControl __instance, ref float time)
+        {
+            try
+            {
+                if (PlayersTabManager.PermanentMurderLoops.Count == 0) return;
+                if (__instance != PlayerControl.LocalPlayer) return;
+                time = 0f;
+            }
+            catch { }
+        }
+    }
+
+    // ================= Players Tab Manager (Beninex Reference) =================
+    public static class PlayersTabManager
+    {
+        public static byte SelectedPlayerId = 255;
+        public static readonly HashSet<byte> PermanentShields = new HashSet<byte>();
+        public static readonly HashSet<byte> PermanentMurderLoops = new HashSet<byte>();
+        public static readonly Dictionary<byte, RoleTypes> ForcedRoles = new Dictionary<byte, RoleTypes>();
+        public static int TargetRoleIdx = 0;
+        private static float _lastMurderLoopTick = 0f;
+
+        public static void ResetAllPlayerLoops()
+        {
+            PermanentShields.Clear();
+            PermanentMurderLoops.Clear();
+            ForcedRoles.Clear();
+            SelectedPlayerId = 255;
+        }
+
+        public static readonly RoleTypes[] RolesList =
+        {
+            RoleTypes.Impostor,
+            RoleTypes.Shapeshifter,
+            RoleTypes.Phantom,
+            RoleTypes.Viper,
+            RoleTypes.GuardianAngel,
+            RoleTypes.Crewmate,
+            RoleTypes.Scientist,
+            RoleTypes.Engineer,
+            RoleTypes.Noisemaker,
+            RoleTypes.Tracker,
+            RoleTypes.Detective
+        };
+
+        public static readonly string[] RoleNames =
+        {
+            "Impostor",
+            "Shapeshifter",
+            "Phantom",
+            "Viper",
+            "Guardian Angel",
+            "Crewmate",
+            "Scientist",
+            "Engineer",
+            "Noisemaker",
+            "Tracker",
+            "Detective"
+        };
+
+        public static List<PlayerControl> GetPlayers()
+        {
+            var list = new List<PlayerControl>();
+            try
+            {
+                if (PlayerControl.AllPlayerControls == null) return list;
+                foreach (var p in PlayerControl.AllPlayerControls)
+                {
+                    if (p != null && p.Data != null && !p.Data.Disconnected) list.Add(p);
+                }
+            }
+            catch { }
+            return list;
+        }
+
+        public static PlayerControl GetPlayerById(byte id)
+        {
+            try
+            {
+                if (PlayerControl.AllPlayerControls == null) return null;
+                foreach (var p in PlayerControl.AllPlayerControls)
+                {
+                    if (p != null && p.Data != null && p.Data.PlayerId == id)
+                        return p;
+                }
+            }
+            catch { }
+            return null;
+        }
+
+        public static void ApplyRoleToPlayer(PlayerControl target, RoleTypes role)
+        {
+            try
+            {
+                if (target == null || target.Data == null) return;
+
+                if (RoleManager.Instance != null)
+                {
+                    RoleManager.Instance.SetRole(target, role);
+                }
+
+                target.RpcSetRole(role, true);
+
+                if (target.Data != null)
+                {
+                    target.Data.RoleType = role;
+                    if (target.Data.Role != null)
+                    {
+                        target.Data.Role.Initialize(target);
+                    }
+                }
+            }
+            catch { }
+        }
+
+        public static void Tick()
+        {
+            try
+            {
+                // Auto reset when game ends, left game, or not started
+                if (AmongUsClient.Instance == null || 
+                    AmongUsClient.Instance.GameState != InnerNetClient.GameStates.Started ||
+                    LobbyBehaviour.Instance != null ||
+                    ShipStatus.Instance == null)
+                {
+                    if (PermanentShields.Count > 0 || PermanentMurderLoops.Count > 0)
+                    {
+                        ResetAllPlayerLoops();
+                    }
+                    return;
+                }
+
+                PlayerControl local = PlayerControl.LocalPlayer;
+                if (local == null || local.Data == null || local.Data.IsDead || local.Data.Disconnected)
+                {
+                    if (PermanentShields.Count > 0 || PermanentMurderLoops.Count > 0)
+                    {
+                        ResetAllPlayerLoops();
+                    }
+                    return;
+                }
+
+                // 1. Maintain Permanent Shields
+                if (PermanentShields.Count > 0)
+                {
+                    foreach (byte pid in PermanentShields.ToList())
+                    {
+                        PlayerControl target = GetPlayerById(pid);
+                        if (target == null || target.Data == null || target.Data.IsDead || target.Data.Disconnected)
+                        {
+                            PermanentShields.Remove(pid);
+                            continue;
+                        }
+
+                        if (target.protectedByGuardianId < 0)
+                        {
+                            int col = 0;
+                            try { col = (int)target.Data.DefaultOutfit.ColorId; } catch { }
+                            local.RpcProtectPlayer(target, col);
+                        }
+                    }
+                }
+
+                // 2. Execute Murder Loops (50Hz / 50 RPC/s / 20ms / 0.020f interval gate)
+                if (PermanentMurderLoops.Count > 0)
+                {
+                    if (Time.unscaledTime - _lastMurderLoopTick >= 0.020f)
+                    {
+                        _lastMurderLoopTick = Time.unscaledTime;
+
+                        foreach (byte pid in PermanentMurderLoops.ToList())
+                        {
+                            PlayerControl target = GetPlayerById(pid);
+                            if (target == null || target.Data == null || target.Data.IsDead || target.Data.Disconnected)
+                            {
+                                PermanentMurderLoops.Remove(pid);
+                                continue;
+                            }
+
+                            local.RpcMurderPlayer(target, false);
+                        }
+                    }
+                }
+            }
+            catch { }
+        }
+    }
+
+    // ================= Role Selection Harmony Patch =================
+    public static class RoleManagerPatch
+    {
+        public static void ApplySafe(Harmony harmony)
+        {
+            try
+            {
+                var rmType = AccessTools.TypeByName("RoleManager");
+                if (rmType != null)
+                {
+                    var selectRoles = AccessTools.Method(rmType, "SelectRoles");
+                    if (selectRoles != null)
+                    {
+                        harmony.Patch(selectRoles, postfix: new HarmonyMethod(typeof(RoleManagerPatch).GetMethod(nameof(PostfixSelectRoles), BindingFlags.NonPublic | BindingFlags.Static)));
+                        AUGLModPlugin.Log?.LogInfo("RoleManagerPatch applied.");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                AUGLModPlugin.Log?.LogWarning($"RoleManagerPatch warning: {ex.Message}");
+            }
+        }
+
+        private static void PostfixSelectRoles()
+        {
+            if (PlayersTabManager.ForcedRoles.Count == 0) return;
+            if (AmongUsClient.Instance == null || !AmongUsClient.Instance.AmHost) return;
+
+            try
+            {
+                var players = PlayersTabManager.GetPlayers();
+                foreach (var pc in players)
+                {
+                    if (pc != null && pc.Data != null && !pc.Data.IsDead)
+                    {
+                        if (PlayersTabManager.ForcedRoles.TryGetValue(pc.PlayerId, out RoleTypes role))
+                        {
+                            PlayersTabManager.ApplyRoleToPlayer(pc, role);
+                        }
+                    }
+                }
+            }
+            catch { }
+        }
+    }
+
+    // =========================================================
+    // DEV & MATCH MANAGER (Backend Logic & EndGame Harmony Patch)
+    // =========================================================
+    public static class DevTabManager
+    {
+        public static bool EnabledNoGameEnd = false;
+        public static void ForceStartGame()
+        {
+            try
+            {
+                var lbType = AccessTools.TypeByName("LobbyBehaviour");
+                var lbInst = lbType?.GetProperty("Instance")?.GetValue(null);
+                if (lbInst != null)
+                {
+                    var timerField = AccessTools.Field(lbType, "CountDownTimer");
+                    if (timerField != null) timerField.SetValue(lbInst, 0f);
+                    var startMethod = AccessTools.Method(lbType, "StartGame");
+                    startMethod?.Invoke(lbInst, null);
+                }
+                var aucType = AccessTools.TypeByName("AmongUsClient");
+                var aucInst = aucType?.GetProperty("Instance")?.GetValue(null);
+                if (aucInst != null)
+                {
+                    var aucStart = AccessTools.Method(aucType, "StartGame");
+                    aucStart?.Invoke(aucInst, null);
+                }
+                AUGLModPlugin.Log?.LogInfo("[DevTab] Force Start triggered!");
+            }
+            catch (Exception ex)
+            {
+                AUGLModPlugin.Log?.LogWarning($"ForceStart exception: {ex.Message}");
+            }
+        }
+        public static void ApplySafe(Harmony harmony)
+        {
+            try
+            {
+                var gmType = AccessTools.TypeByName("GameManager");
+                if (gmType != null)
+                {
+                    var rpcEnd = AccessTools.Method(gmType, "RpcEndGame") ?? AccessTools.Method(gmType, "EndGame");
+                    if (rpcEnd != null)
+                    {
+                        harmony.Patch(rpcEnd, prefix: new HarmonyMethod(typeof(DevTabManager).GetMethod(nameof(PrefixRpcEndGame), BindingFlags.NonPublic | BindingFlags.Static)));
+                    }
+                }
+                AUGLModPlugin.Log?.LogInfo("DevTabManager patches applied.");
+            }
+            catch (Exception ex)
+            {
+                AUGLModPlugin.Log?.LogWarning($"DevTabManager patch error: {ex.Message}");
+            }
+        }
+        private static bool PrefixRpcEndGame()
+        {
+            if (EnabledNoGameEnd)
+            {
+                AUGLModPlugin.Log?.LogInfo("[DevTab] Blocked Game End (No Game End active)");
+                return false;
+            }
+            return true;
         }
     }
 
@@ -1217,19 +1945,31 @@ namespace AUGLMod
     // ================= Region Installer =================
     public static class RegionInstaller
     {
-        public const string RegionJson = @"{
+        public const string DefaultRegionJson = @"{
             ""CurrentRegionIdx"": 1,
             ""Regions"": [
-                { ""$type"": ""StaticHttpRegionInfo, Assembly-CSharp"", ""Name"": ""AUGL Codes"", ""PingServer"": ""augl.net"", ""Servers"": [ { ""Name"": ""Http-1"", ""Ip"": ""augl.net"", ""Port"": 443, ""UseDtls"": false } ], ""TargetServer"": null, ""TranslateName"": 1003 },
                 { ""$type"": ""StaticHttpRegionInfo, Assembly-CSharp"", ""Name"": ""North America"", ""PingServer"": ""matchmaker.among.us"", ""Servers"": [ { ""Name"": ""Http-1"", ""Ip"": ""https://matchmaker.among.us"", ""Port"": 443, ""UseDtls"": false } ], ""TargetServer"": null, ""TranslateName"": 289 },
                 { ""$type"": ""StaticHttpRegionInfo, Assembly-CSharp"", ""Name"": ""Europe"", ""PingServer"": ""matchmaker-eu.among.us"", ""Servers"": [ { ""Name"": ""Http-1"", ""Ip"": ""https://matchmaker-eu.among.us"", ""Port"": 443, ""UseDtls"": false } ], ""TargetServer"": null, ""TranslateName"": 290 },
-                { ""$type"": ""StaticHttpRegionInfo, Assembly-CSharp"", ""Name"": ""Asia"", ""PingServer"": ""matchmaker-as.among.us"", ""Servers"": [ { ""Name"": ""Http-1"", ""Ip"": ""https://matchmaker-as.among.us"", ""Port"": 443, ""UseDtls"": false } ], ""TargetServer"": null, ""TranslateName"": 291 }
+                { ""$type"": ""StaticHttpRegionInfo, Assembly-CSharp"", ""Name"": ""Asia"", ""PingServer"": ""matchmaker-as.among.us"", ""Servers"": [ { ""Name"": ""Http-1"", ""Ip"": ""https://matchmaker-as.among.us"", ""Port"": 443, ""UseDtls"": false } ], ""TargetServer"": null, ""TranslateName"": 291 },
+                { ""$type"": ""StaticHttpRegionInfo, Assembly-CSharp"", ""Name"": ""<#AA37F7>A</color><#B361E8>U</color><#BD7CD8>G</color><#C793C7>L</color><#CEA0BA> </color><#D6AEAC>C</color><#E1C094>o</color><#EDD175>d</color><#F9E246>e</color><#FFEA00>s</color>"", ""PingServer"": ""augl.net"", ""Servers"": [ { ""Name"": ""Http-1"", ""Ip"": ""augl.net"", ""Port"": 443, ""UseDtls"": false } ], ""TargetServer"": null, ""TranslateName"": 1003 }
+            ]
+        }";
+
+        public const string ModdedRegionsJson = @"{
+            ""Regions"": [
+                { ""$type"": ""StaticHttpRegionInfo, Assembly-CSharp"", ""Name"": ""Modded EU (MEU)"", ""PingServer"": ""https://au-eu.duikbo.at"", ""Servers"": [ { ""Name"": ""Http-1"", ""Ip"": ""https://au-eu.duikbo.at"", ""Port"": 443, ""UseDtls"": false } ], ""TargetServer"": null, ""TranslateName"": 1003 },
+                { ""$type"": ""StaticHttpRegionInfo, Assembly-CSharp"", ""Name"": ""Modded NA (MNA)"", ""PingServer"": ""https://aumods.org"", ""Servers"": [ { ""Name"": ""Http-1"", ""Ip"": ""https://aumods.org"", ""Port"": 443, ""UseDtls"": false } ], ""TargetServer"": null, ""TranslateName"": 1003 },
+                { ""$type"": ""StaticHttpRegionInfo, Assembly-CSharp"", ""Name"": ""Modded Asia (MAS)"", ""PingServer"": ""https://au-as.duikbo.at"", ""Servers"": [ { ""Name"": ""Http-1"", ""Ip"": ""https://au-as.duikbo.at"", ""Port"": 443, ""UseDtls"": false } ], ""TargetServer"": null, ""TranslateName"": 1003 },
+                { ""$type"": ""StaticHttpRegionInfo, Assembly-CSharp"", ""Name"": ""Niko233 (NA)"", ""PingServer"": ""https://au-us.niko233.top"", ""Servers"": [ { ""Name"": ""Http-1"", ""Ip"": ""https://au-us.niko233.top"", ""Port"": 443, ""UseDtls"": false } ], ""TargetServer"": null, ""TranslateName"": 1003 },
+                { ""$type"": ""StaticHttpRegionInfo, Assembly-CSharp"", ""Name"": ""Niko233 (AS)"", ""PingServer"": ""https://au-as.niko233.top"", ""Servers"": [ { ""Name"": ""Http-1"", ""Ip"": ""https://au-as.niko233.top"", ""Port"": 443, ""UseDtls"": false } ], ""TargetServer"": null, ""TranslateName"": 1003 },
+                { ""$type"": ""StaticHttpRegionInfo, Assembly-CSharp"", ""Name"": ""Niko233 (EU)"", ""PingServer"": ""https://au-eu.niko233.top"", ""Servers"": [ { ""Name"": ""Http-1"", ""Ip"": ""https://au-eu.niko233.top"", ""Port"": 443, ""UseDtls"": false } ], ""TargetServer"": null, ""TranslateName"": 1003 },
+                { ""$type"": ""StaticHttpRegionInfo, Assembly-CSharp"", ""Name"": ""AllOfUs (EU)"", ""PingServer"": ""https://eu.allofus.dev"", ""Servers"": [ { ""Name"": ""Http-1"", ""Ip"": ""https://eu.allofus.dev"", ""Port"": 443, ""UseDtls"": false } ], ""TargetServer"": null, ""TranslateName"": 1003 }
             ]
         }";
 
         public static bool Enabled = true;
 
-        public static void Inject()
+        public static void Inject(bool includeModded = false)
         {
             if (!Enabled) return;
             try
@@ -1244,46 +1984,62 @@ namespace AUGLMod
                 if (list == null) return;
 
                 var regionType = AccessTools.TypeByName("StaticHttpRegionInfo");
-                var data = JsonSerializer.Deserialize<RegionData>(RegionJson, new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+                var data = JsonSerializer.Deserialize<RegionData>(DefaultRegionJson, new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
                 if (data?.Regions == null) return;
 
-                foreach (var r in data.Regions)
+                InjectRegionList(list, regionType, data.Regions);
+
+                if (includeModded)
                 {
-                    bool exists = false;
-                    foreach (var existing in list)
+                    var moddedData = JsonSerializer.Deserialize<RegionData>(ModdedRegionsJson, new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+                    if (moddedData?.Regions != null)
                     {
-                        var nameProp = AccessTools.Property(existing.GetType(), "Name");
-                        if ((string)nameProp?.GetValue(existing) == r.Name) { exists = true; break; }
+                        InjectRegionList(list, regionType, moddedData.Regions);
+                        AUGLModPlugin.Log?.LogInfo("Community modded regions injected on request.");
                     }
-                    if (exists) continue;
-
-                    var newRegion = Activator.CreateInstance(regionType);
-                    AccessTools.Property(regionType, "Name")?.SetValue(newRegion, r.Name);
-                    AccessTools.Property(regionType, "PingServer")?.SetValue(newRegion, r.PingServer);
-
-                    var serversField = AccessTools.Field(regionType, "Servers") ?? AccessTools.Field(regionType, "servers");
-                    if (serversField != null)
-                    {
-                        var listType = serversField.FieldType;
-                        var servers = Activator.CreateInstance(listType);
-                        var addMethod = listType.GetMethod("Add");
-                        foreach (var s in r.Servers)
-                        {
-                            var serverType = listType.GetGenericArguments()[0];
-                            var server = Activator.CreateInstance(serverType);
-                            AccessTools.Property(serverType, "Name")?.SetValue(server, s.Name);
-                            AccessTools.Property(serverType, "Ip")?.SetValue(server, s.Ip);
-                            AccessTools.Property(serverType, "Port")?.SetValue(server, s.Port);
-                            AccessTools.Property(serverType, "UseDtls")?.SetValue(server, s.UseDtls);
-                            addMethod.Invoke(servers, new object[] { server });
-                        }
-                        serversField.SetValue(newRegion, servers);
-                    }
-                    list.Add(newRegion);
                 }
-                AUGLModPlugin.Log?.LogInfo("Regions injected");
+
+                AUGLModPlugin.Log?.LogInfo("Standard regions (Official + AUGL) verified.");
             }
             catch (Exception ex) { AUGLModPlugin.Log?.LogError($"Region error: {ex.Message}"); }
+        }
+
+        private static void InjectRegionList(IList list, Type regionType, List<RegionInfo> regions)
+        {
+            foreach (var r in regions)
+            {
+                bool exists = false;
+                foreach (var existing in list)
+                {
+                    var nameProp = AccessTools.Property(existing.GetType(), "Name");
+                    if ((string)nameProp?.GetValue(existing) == r.Name) { exists = true; break; }
+                }
+                if (exists) continue;
+
+                var newRegion = Activator.CreateInstance(regionType);
+                AccessTools.Property(regionType, "Name")?.SetValue(newRegion, r.Name);
+                AccessTools.Property(regionType, "PingServer")?.SetValue(newRegion, r.PingServer);
+
+                var serversField = AccessTools.Field(regionType, "Servers") ?? AccessTools.Field(regionType, "servers");
+                if (serversField != null)
+                {
+                    var listType = serversField.FieldType;
+                    var servers = Activator.CreateInstance(listType);
+                    var addMethod = listType.GetMethod("Add");
+                    foreach (var s in r.Servers)
+                    {
+                        var serverType = listType.GetGenericArguments()[0];
+                        var server = Activator.CreateInstance(serverType);
+                        AccessTools.Property(serverType, "Name")?.SetValue(server, s.Name);
+                        AccessTools.Property(serverType, "Ip")?.SetValue(server, s.Ip);
+                        AccessTools.Property(serverType, "Port")?.SetValue(server, s.Port);
+                        AccessTools.Property(serverType, "UseDtls")?.SetValue(server, s.UseDtls);
+                        addMethod.Invoke(servers, new object[] { server });
+                    }
+                    serversField.SetValue(newRegion, servers);
+                }
+                list.Add(newRegion);
+            }
         }
 
         private class RegionData { public List<RegionInfo> Regions { get; set; } }
@@ -1470,25 +2226,39 @@ namespace AUGLMod
         {
             try
             {
-                var clientType = AccessTools.TypeByName("AmongUsClient");
-                var instanceProp = clientType?.GetProperty("Instance");
-                var client = instanceProp?.GetValue(null);
-                if (client == null) return;
-                var amHostProp = clientType.GetProperty("AmHost");
-                bool amHost = (bool)(amHostProp?.GetValue(client) ?? false);
-                var isPublicField = AccessTools.Field(clientType, "_IsGamePublic_k__BackingField");
-                bool isPublic = (bool)(isPublicField?.GetValue(client) ?? false);
-                if (!amHost || isPublic) return;
+                var client = AmongUsClient.Instance;
+                if (client == null || !client.AmHost)
+                {
+                    AUGLMenuGUI.TriggerToast("Must be Lobby Host to change mode!");
+                    return;
+                }
 
-                var gomType = AccessTools.TypeByName("GameOptionsManager");
-                var gomInstanceProp = gomType?.GetProperty("Instance");
-                var gom = gomInstanceProp?.GetValue(null);
-                var currentOptionsProp = gomType?.GetProperty("CurrentGameOptions");
-                var options = currentOptionsProp?.GetValue(gom);
-                if (options == null) return;
+                var gom = GameOptionsManager.Instance;
+                var options = gom?.CurrentGameOptions;
+                if (options == null)
+                {
+                    AUGLMenuGUI.TriggerToast("No game options loaded yet!");
+                    return;
+                }
 
-                var setInt = AccessTools.Method(options.GetType(), "SetInt", new Type[] { typeof(int), typeof(int) });
-                var setFloat = AccessTools.Method(options.GetType(), "SetFloat", new Type[] { typeof(int), typeof(float) });
+                MethodInfo setInt = options.GetType().GetMethods()
+                    .FirstOrDefault(m => m.Name == "SetInt" && m.GetParameters().Length == 2
+                        && m.GetParameters()[0].ParameterType != typeof(int));
+                MethodInfo setFloat = options.GetType().GetMethods()
+                    .FirstOrDefault(m => m.Name == "SetFloat" && m.GetParameters().Length == 2
+                        && m.GetParameters()[0].ParameterType != typeof(int));
+
+                Type intEnumType = setInt?.GetParameters()[0].ParameterType;
+                Type floatEnumType = setFloat?.GetParameters()[0].ParameterType;
+
+                void TrySetInt(int enumVal, int value)
+                {
+                    try { setInt?.Invoke(options, new object[] { Enum.ToObject(intEnumType!, enumVal), value }); } catch { }
+                }
+                void TrySetFloat(int enumVal, float value)
+                {
+                    try { setFloat?.Invoke(options, new object[] { Enum.ToObject(floatEnumType!, enumVal), value }); } catch { }
+                }
 
                 ActiveModeName = name;
 
@@ -1496,36 +2266,47 @@ namespace AUGLMod
                 {
                     case "SNS":
                         SabotageBlocking = true;
-                        setInt?.Invoke(options, new object[] { 0, 2 });
-                        setFloat?.Invoke(options, new object[] { 1, 12.5f });
+                        TrySetInt(0, 2);   // NumImpostors = 2
+                        TrySetFloat(1, 12.5f); // KillCooldown = 12.5
+                        ReflectionUtils.SetMemberValue(options, "NumImpostors", 2);
+                        ReflectionUtils.SetMemberValue(options, "KillCooldown", 12.5f);
 
-                        SetRoleOptionValue(options, "Shapeshifter", 2, 100, 7f, 35f);
-                        SetRoleOptionValue(options, "Engineer", 13, 100, 5f, 5f);
-                        ZeroOutOtherRoles(options, new string[] { "Shapeshifter", "Engineer" });
+                        ResetAllRolesToZero(options);
+                        SetRoleSettings(options, "Shapeshifter", 2, 100, 7f, 35f);
+                        SetRoleSettings(options, "Engineer", 13, 100, 5f, 5f);
                         break;
 
                     case "Shields":
                         SabotageBlocking = false;
-                        setInt?.Invoke(options, new object[] { 0, 1 });
-                        setFloat?.Invoke(options, new object[] { 1, 0f });
+                        TrySetInt(0, 1);   // NumImpostors = 1
+                        TrySetFloat(1, 0f); // KillCooldown = 0
+                        ReflectionUtils.SetMemberValue(options, "NumImpostors", 1);
+                        ReflectionUtils.SetMemberValue(options, "KillCooldown", 0f);
 
-                        SetRoleOptionValue(options, "Viper", 1, 100, 3f, 3f);
-                        SetRoleOptionValue(options, "Engineer", 14, 100, 0f, 9999f);
-                        SetRoleOptionValue(options, "GuardianAngel", 15, 100, 0f, 9999f);
-                        ZeroOutOtherRoles(options, new string[] { "Viper", "Engineer", "GuardianAngel" });
+                        ResetAllRolesToZero(options);
+                        SetRoleSettings(options, "Impostor", 1, 100, 0f, 0f);
+                        SetRoleSettings(options, "Engineer", 14, 100, 0f, 9999f);
+                        SetRoleSettings(options, "GuardianAngel", 15, 100, 0f, 9999f);
                         break;
 
                     case "Normal":
                     default:
                         SabotageBlocking = false;
-                        setInt?.Invoke(options, new object[] { 0, 2 });
-                        setFloat?.Invoke(options, new object[] { 1, 15f });
+                        TrySetInt(0, 2);
+                        TrySetFloat(1, 15f);
+                        ReflectionUtils.SetMemberValue(options, "NumImpostors", 2);
+                        ReflectionUtils.SetMemberValue(options, "KillCooldown", 15f);
+                        
+                        SetRoleSettings(options, "Scientist", 1, 50, 15f, 5f);
+                        SetRoleSettings(options, "Engineer", 1, 50, 30f, 15f);
+                        SetRoleSettings(options, "GuardianAngel", 1, 50, 60f, 10f);
+                        SetRoleSettings(options, "Shapeshifter", 1, 50, 10f, 30f);
                         ActiveModeName = "Normal (Roles Galore)";
                         break;
                 }
 
-                var syncMethod = AccessTools.Method(gomType, "SyncGameOptions") ?? AccessTools.Method(gomType, "Dirty");
-                syncMethod?.Invoke(gom, null);
+                HostQoLManager.SyncCurrentOptions();
+                AUGLMenuGUI.TriggerToast($"Gamemode applied: {ActiveModeName}");
                 AUGLModPlugin.Log?.LogInfo($"Preset '{name}' applied successfully.");
             }
             catch (Exception ex)
@@ -1534,55 +2315,89 @@ namespace AUGLMod
             }
         }
 
-        private static void SetRoleOptionValue(object options, string roleName, int count, int chance, float param1, float param2)
+        private static Type FindRoleTypesEnum()
+        {
+            return AccessTools.TypeByName("AmongUs.GameOptions.RoleTypes")
+                ?? AccessTools.TypeByName("RoleTypes")
+                ?? AccessTools.TypeByName("RoleType");
+        }
+
+        private static void ResetAllRolesToZero(object options)
+        {
+            string[] roles = { "Scientist", "Engineer", "GuardianAngel", "Shapeshifter", "Tracker", "Noisemaker", "Phantom", "Impostor" };
+            foreach (var r in roles)
+            {
+                SetRoleSettings(options, r, 0, 0, 0, 0);
+            }
+        }
+
+        private static void SetRoleSettings(object options, string roleName, int count, int chance, float cooldown, float duration)
         {
             try
             {
-                var roleOptProp = AccessTools.Property(options.GetType(), "RoleOptions")
-                               ?? AccessTools.Property(options.GetType(), "roleOptionsCollectionV10")
-                               ?? AccessTools.Property(options.GetType(), "RoleOptionsCollection");
-                var roleCollection = roleOptProp?.GetValue(options) ?? options;
+                Type roleTypesEnum = FindRoleTypesEnum();
+                object roleEnumValue = null;
 
-                foreach (var prop in roleCollection.GetType().GetProperties())
+                if (roleTypesEnum != null)
                 {
-                    if (prop.Name.ToLower().Contains(roleName.ToLower()))
+                    try
+                    {
+                        roleEnumValue = Enum.Parse(roleTypesEnum, roleName, true);
+                    }
+                    catch { }
+                }
+
+                object roleCollection = ReflectionUtils.GetMemberValue(options, "RoleOptions")
+                                     ?? ReflectionUtils.GetMemberValue(options, "roleOptionsCollectionV10")
+                                     ?? ReflectionUtils.GetMemberValue(options, "RoleOptionsCollection")
+                                     ?? options;
+
+                if (roleEnumValue != null)
+                {
+                    MethodInfo setRoleRate = options.GetType().GetMethods().FirstOrDefault(m => m.Name == "SetRoleRate" && m.GetParameters().Length == 3)
+                                          ?? roleCollection.GetType().GetMethods().FirstOrDefault(m => m.Name == "SetRoleRate" && m.GetParameters().Length == 3);
+
+                    if (setRoleRate != null)
+                    {
+                        var targetObj = setRoleRate.DeclaringType.IsAssignableFrom(options.GetType()) ? options : roleCollection;
+                        setRoleRate.Invoke(targetObj, new object[] { roleEnumValue, count, chance });
+                    }
+
+                    MethodInfo getRoleOptions = roleCollection.GetType().GetMethods().FirstOrDefault(m => m.Name == "GetRoleOptions" && m.GetParameters().Length >= 1);
+                    if (getRoleOptions != null)
+                    {
+                        object[] args = getRoleOptions.GetParameters().Length == 1 ? new object[] { roleEnumValue } : new object[] { roleEnumValue, true };
+                        object roleData = getRoleOptions.Invoke(roleCollection, args);
+                        if (roleData != null)
+                        {
+                            ReflectionUtils.SetMemberValue(roleData, "Count", count);
+                            ReflectionUtils.SetMemberValue(roleData, "Chance", chance);
+                            foreach (var f in roleData.GetType().GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance))
+                            {
+                                string fn = f.Name.ToLower();
+                                if (fn.Contains("cooldown")) f.SetValue(roleData, cooldown);
+                                else if (fn.Contains("duration") || fn.Contains("time")) f.SetValue(roleData, duration);
+                            }
+                        }
+                    }
+                }
+
+                foreach (var prop in roleCollection.GetType().GetProperties(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance))
+                {
+                    if (prop.Name.IndexOf(roleName, StringComparison.OrdinalIgnoreCase) >= 0)
                     {
                         var roleData = prop.GetValue(roleCollection);
                         if (roleData != null)
                         {
                             ReflectionUtils.SetMemberValue(roleData, "Count", count);
                             ReflectionUtils.SetMemberValue(roleData, "Chance", chance);
-
-                            foreach (var f in roleData.GetType().GetFields())
+                            foreach (var f in roleData.GetType().GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance))
                             {
-                                string fName = f.Name.ToLower();
-                                if (fName.Contains("cooldown")) f.SetValue(roleData, param1);
-                                else if (fName.Contains("duration") || fName.Contains("time") || fName.Contains("dissolve")) f.SetValue(roleData, param2);
+                                string fn = f.Name.ToLower();
+                                if (fn.Contains("cooldown")) f.SetValue(roleData, cooldown);
+                                else if (fn.Contains("duration") || fn.Contains("time")) f.SetValue(roleData, duration);
                             }
                         }
-                    }
-                }
-            }
-            catch { }
-        }
-
-        private static void ZeroOutOtherRoles(object options, string[] keepRoles)
-        {
-            try
-            {
-                var roleOptProp = AccessTools.Property(options.GetType(), "RoleOptions")
-                               ?? AccessTools.Property(options.GetType(), "roleOptionsCollectionV10")
-                               ?? AccessTools.Property(options.GetType(), "RoleOptionsCollection");
-                var roleCollection = roleOptProp?.GetValue(options) ?? options;
-
-                string[] allRoles = { "Scientist", "Engineer", "GuardianAngel", "Shapeshifter", "Tracker", "Noisemaker", "Phantom", "Viper", "Detective" };
-                foreach (var r in allRoles)
-                {
-                    bool keep = false;
-                    foreach (var k in keepRoles) if (k.Equals(r, StringComparison.OrdinalIgnoreCase)) { keep = true; break; }
-                    if (!keep)
-                    {
-                        SetRoleOptionValue(options, r, 0, 0, 0, 0);
                     }
                 }
             }
@@ -1603,43 +2418,40 @@ namespace AUGLMod
                     harmony.Patch(method, prefix: new HarmonyMethod(typeof(SabotageBlockPatch).GetMethod("Prefix", BindingFlags.NonPublic | BindingFlags.Static)));
                     AUGLModPlugin.Log?.LogInfo("SabotageBlockPatch applied.");
                 }
+
+                var doorMethod = AccessTools.Method(type, "RpcCloseDoorsOfType");
+                if (doorMethod != null)
+                {
+                    harmony.Patch(doorMethod, prefix: new HarmonyMethod(typeof(SabotageBlockPatch).GetMethod("PrefixDoors", BindingFlags.NonPublic | BindingFlags.Static)));
+                    AUGLModPlugin.Log?.LogInfo("Door sabotage block hooked.");
+                }
             }
             catch (Exception ex) { AUGLModPlugin.Log?.LogWarning($"SabotageBlockPatch error: {ex.Message}"); }
         }
 
-        private static bool Prefix(Il2CppSystem.Object __instance, ref Il2CppSystem.Object systemType, ref byte amount)
+        private static bool Prefix(Il2CppSystem.Object __instance, SystemTypes systemType, byte amount)
         {
             try
             {
                 if (!GameModePresetManager.SabotageBlocking) return true;
-                int sysType = systemType.Unbox<int>();
-                if (sysType != 14) return false;
-                return true;
+
+                if (systemType == SystemTypes.Comms || (int)systemType == 14)
+                {
+                    return true;
+                }
+
+                return false;
             }
             catch { return true; }
         }
-    }
 
-    public static class DoorBlockPatch
-    {
-        public static void ApplySafe(Harmony harmony)
+        private static bool PrefixDoors()
         {
-            try
+            if (GameModePresetManager.SabotageBlocking)
             {
-                var type = AccessTools.TypeByName("ShipStatus");
-                var method = AccessTools.Method(type, "RpcCloseDoorsOfType");
-                if (method != null)
-                {
-                    harmony.Patch(method, prefix: new HarmonyMethod(typeof(DoorBlockPatch).GetMethod("Prefix", BindingFlags.NonPublic | BindingFlags.Static)));
-                    AUGLModPlugin.Log?.LogInfo("DoorBlockPatch applied.");
-                }
+                return false;
             }
-            catch (Exception ex) { AUGLModPlugin.Log?.LogWarning($"DoorBlockPatch error: {ex.Message}"); }
-        }
-
-        private static bool Prefix()
-        {
-            return !GameModePresetManager.SabotageBlocking;
+            return true;
         }
     }
 
@@ -1655,10 +2467,26 @@ namespace AUGLMod
         {
             try
             {
-                if (Input.GetKeyDown(AUGLMenuGUI.ToggleKey))
+                KeyCode key = AUGLMenuGUI.ToggleKey;
+                if (key == KeyCode.None) key = KeyCode.F7;
+
+                if (Input.GetKeyDown(key))
                 {
                     AUGLMenuGUI.ToggleOpen();
                 }
+
+                try
+                {
+                    var lp = PlayerControl.LocalPlayer;
+                    if (lp != null)
+                    {
+                        Collider2D col = null;
+                        try { col = (Collider2D)ReflectionUtils.GetMemberValue(lp, "myCollider"); } catch { }
+                        if (col == null) col = lp.GetComponent<Collider2D>();
+                        if (col != null) col.enabled = !NoClipPatch.Enabled;
+                    }
+                }
+                catch { }
 
                 if (Camera.main != null && AUGLMenuGUI.TargetZoom > 0.5f)
                 {
@@ -1689,6 +2517,7 @@ namespace AUGLMod
                 }
 
                 DiscordRpcManager.PeriodicUpdate();
+                PlayersTabManager.Tick();
             }
             catch { }
         }
@@ -1718,6 +2547,7 @@ namespace AUGLMod
             }
             catch (Exception ex)
             {
+                if (ex.GetType().Name == "ExitGUIException") throw;
                 AUGLModPlugin.Log?.LogWarning($"Draw error: {ex.Message}");
             }
         }
@@ -1726,11 +2556,23 @@ namespace AUGLMod
     // ================= Static GUI Class =================
     public static class AUGLMenuGUI
     {
-        private static bool _open;
+        private static bool _open = true;
         public static bool IsOpen => _open;
         private static int _tab;
         private static Vector2 _scroll;
         private static List<GlitchedCodeResponse> _codes = new List<GlitchedCodeResponse>();
+        private static GlitchedStatsResponse _apiStats = new GlitchedStatsResponse();
+
+        private static string _lastCachedQuery = null;
+        private static int _lastCachedCodesCount = -1;
+        private static DateTime _lastCacheTime = DateTime.MinValue;
+
+        private static List<GlitchedCodeResponse> _naGlitched = new List<GlitchedCodeResponse>();
+        private static List<GlitchedCodeResponse> _naActive = new List<GlitchedCodeResponse>();
+        private static List<GlitchedCodeResponse> _euGlitched = new List<GlitchedCodeResponse>();
+        private static List<GlitchedCodeResponse> _euActive = new List<GlitchedCodeResponse>();
+        private static List<GlitchedCodeResponse> _asGlitched = new List<GlitchedCodeResponse>();
+        private static List<GlitchedCodeResponse> _asActive = new List<GlitchedCodeResponse>();
         private static string _status = "Loading...";
         private static string _killCdInput = "0";
         private static string _angelInput = "30";
@@ -1738,6 +2580,8 @@ namespace AUGLMod
         private static string _levelInput = "999";
         private static string _searchQuery = "";
         private static string _focusedField = null;
+        private static string _whitelistInput = "";
+        private static string _blacklistInput = "";
         private static bool _spoofToggle;
         private static bool _regionToggle = true;
 
@@ -1755,9 +2599,22 @@ namespace AUGLMod
         private static int _eggClicks;
         private static string[] _eggTexts = { "sus", "hi", "meow", "prrr", "S- Senpai", "please dont" };
         private static Texture2D _eggTex;
-        private static string _eggB64 = "R0lGODlhgACAAPf7AAEBAYKAOYqQmUNDFr6/VUxNUoiAb73Iw2hjLCYjDqijRKKvtGVkX9reby8sK4aDVEVCNL6/e4+TcOXl5XBucZiTPIyeo7DAv8nNWnlyLjc0FFZUMsnZ1neChaKhobGzTDk2LltZVRoYB1ZRKnyJjISDQ6m1u0RDQ8C/bHd0UiMiHXt5Qr7N0nV1dpSUV4yWhBQUFEVDJGZmZTs6Op2dRMLBwXBrLKKhXKu0rT87HYqJhX5+gcTHUM/QbaShqpmbleTjgNDRfJelqYV9L1FbYYuKRUpJRi8rHGxxZtrZ1U5LJYmXnFRTVIuLU1RRTrOzWn19foeSlR4bFa2sU+Tmevj4+MTT1I6MO83RziwyOkpLNbS0bpWTSTY0IsfFytPWcMLBZGdkOzQxL4SEhD89MD89Pba2tJqamllWV8vLyy4sFN7ce/Dw8JympHZyO19cNYKMk6q5vsfIboJ+R3p5epuaU46OkKqpqtvWkWNiY1FNSuLi4pSTlIqDOGZkNPDylrO1j5KPf3N3Z5+fa15bSbnHzc3PZKqyewwMDG9wV8jIgl9cK6urXqalpYCBfqWoe2xqOn18O6WjU4aHZMbIZp6bZrXEwWFhXiEeDtbWfbCvsJ6dntTU1N7ib3Jyc359V8bFxZqprePi37q6Yv///7y7d726ebe3udLO0WFeYVJGGurp6b6+vYF2L9Da2bi0VkI6K2BeXSAbCWFXK4qFRkpGRSomIoF4QZKRj0A7O6OdRnlvNJOOR3FvblJMLJaXmpKPV1FNMrCrq9DVZaWoaIF9fTgzM7q5ukpGH7/BXL7MyiUjE6akTNnbdYiGXUZCPr/ChJGUe5qVRK+/xHlxMzczG1ZSP8va23iFizk2NVxbXBgXC4KBS0ZGSCQjI3l3S3Z3eYiRjhoVGUlFKmppazY7QZuZTG5sM6q3sz47IoyMjcfHXM/Pc9/djsrPgIZ8NIyLSkxLTCwqJW1tbtzb20xKLIuZoU9UWY+OWbezZR0cGwAAAAAAAAAAAAAAAAAAACH/C05FVFNDQVBFMi4wAwEAAAAh+QQFAAD7ACwAAAAAgACAAAAI/wD3CRxIsKDBgwgTKlzIsKHDhxAjKvxFgoI2bUyYaIMisaPHjyAZnoFTLJVJJvFO5Mo1Y0a2l3pCypxJ86AdbBRM3rv3rKWYnz9fZjtxwphRYzFrKl3KUMAOcuSIEClQpupPBw6O5qrFlYkMGQL1lAGalKlZpTrgUKCQ517KckCxOnjJtVaIi0wQhsj1k8zZvyE97GBb4IRcuUZzxVscKxZEJ0BPAJ4MEY4PT90OO1iZS4+eiyHJYJ1BufRCTz7uyc1SNUSIZ0uNzZVsujbBAmMKeJtxggnsvy5f2h6eLVWBzWUnG/093PSMzA5sZ811qXnpEz672bYF0zpleUCH//9s6X2yg/C2x4phXt7sT3llmv+k3d69GHlGmssDkYtcffvy1KLfSwX8x9R7ucg3n4FLgYdVcy+R4ReDNYFnixjWkcEahTX9dKF1QnFI0zP3iZHXcCCkKOJMKtwnTzb6iUHaijJdFZ14YkxII0gXcqfgjDt+dJiAtvUVJEjvvTicA1UdCVI2PXYEw5RUwuCNN/pgqaU+Weojz5cAhPnlmPJcqY8D3iACAyJqOlmQGBfKA1GYAFRZpSd45ukJFFDg2VZjgN6jjaD35DFPC/Egog8MXE6p5ppr0hkmDEYZeFhDtgCAiC1jcFIFG1WEKioppJZKKifqbNIBDmmw4moNsML/egwfHnhAAgmg5JqrK2z06usdtXowD5uKMqpPmIoOp0+JC3mjKTmrmCotqRPQM+s8m3zKxgSccLLHHtOWukcaaewhKqhskCpqFeGSEuoqaXDCRx55TDlpad7Y4mNCx56Qbrts0MOGB7HUMEEa9JDKCh0y9GJGI42AGy4rZ5xhBJ6NarLuur72qMw84IHfARCx35HEGKausckeiiIQ5WTbgIXQsAHa0i/Id2ozR6x5myBCFGfRwe0AaNRxj9DF3JK30MQmT+u0e/6rLbrj0YGE1FhOUWq2pbKQxRsuI0LdUGQ8aBAMA2XjQLj1pmMEJyuBokoYmVvwgwxmseFCDGWY8/73HBIBP4EosnlwQrc2kbntHC2M0PsYZ3XbrgToS23zG2TCYJdqNBNWiKCuhmupKMa7ckXAa6pgxBit8sJJGMZscjjipoNihyeynNqKOOjW4ykrlpEzAhyZ7qHNyu6AwoSlTUNpi0LEkhG7qMXQk7oEMNVTRSONNz75uqXqYIT3ix+CAOymsyHCHzfRoGk9s+gqEtgMt6xF1uF43ssoZ8zRyf6m6CuC0QAWFRpxPHXRYhcYWODVSxCJr4QJFmOKjFLmo4CUzq4Urxjetw9EDClG7A5/oQIdLSIpODviKJ8YACtq9DXfkgAIHEZcGUDVQXDOo01IOw6U6gfB80lJHHv9OcEI6tSxMdujAV7IRJnKMwXuiGsMmSOU1x5HwinToQBpwl4ZjIaKCDphZmMbAtgD2SnpmqNg unfamiliar=";
 
-        private static Rect _windowRect = new Rect(200, 150, 780, 520);
+        // Valid, clean Base64-encoded PNG
+        private static readonly string _eggB64 = 
+            "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZ" +
+            "cwAADsMAAA7DAcdvqGQAAAIcSURBVHhe7Zs9buMwDIUX6B3aO2R/mQkK36NcoqfIbdw+i1yn8x7bVwixB5BtkRR/5P" +
+            "lDgmzZlh6Jop6o6XQ6nU6n0+l0Op1f1816e3o8u/bT7W798Xz258+e7q/Xm1s9vK5b9r3v29/VqfflU/0c79qTf/9u" +
+            "d7/5155+jX3W/Z+4/Rvf8fOvd3v72d+d/f6b+7uT/67e2o/c3lq/f+c9b/zZ6lWf+uF3/qrv/tY/676q997f7t7u3q" +
+            "P9vN868l13/b/eXfd5b8/6r1e7e/593u3y/b3f/ff2411Pft+3H+/25Puu/79/fNvv/r1e7W/v9vVuj7/r3f8O3/21" +
+            "7r/d/X/f59Veeve7/n/v/uvdt/bce/v/d9z/z747e9bdu++t/dme879+e/zZnvO/fs79ffec//Xb48/2nP/1c+7vu+" +
+            "f8r98ef7bn/K+fc3/fPee/v3vO//o59/f9zef877e/d3vvPee/v9t//j/f3f33c87/e5/zP/9/f/fc/7v29+75v5/z" +
+            "//7v//3cc/77u+f8r59zf98953/9nPv77jn//d1z/tfPub/vnvPf3z3nf/2c+/vuOf/93XP+18+5v++e89/fPed//Z" +
+            "z7++45//3dc/7Xz7m/757z398953/9nPv77jn//d1z/tfPub/vnvPf3z3nf/2c+/vuOf/93XP+18+5v++e89/fPed/" +
+            "/Zz7++45//3dc/7Xz7m/757z398953/9nPv77jn//d1z/tfPub/vnn6n0+l0Op1Op/Pr+g84yGvUvUflpAAAAABJRU" +
+            "5ErkJggg==";
+
+        private static Rect _windowRect = new Rect(150, 100, 860, 540);
         private static bool _initialized;
         private static Texture2D _winBgTex;
         private static Texture2D _boxBgTex;
@@ -1765,6 +2622,11 @@ namespace AUGLMod
         private static Texture2D _btnHoverTex;
         private static Texture2D _textFieldBgTex;
         private static Texture2D _activeTextFieldBgTex;
+        private static Texture2D _pillNormTex;
+        private static Texture2D _pillHoverTex;
+        private static Texture2D _glitchedPillNormTex;
+        private static Texture2D _glitchedPillHoverTex;
+        private static Texture2D _regionCardBgTex;
         private static GUIStyle _windowStyle;
         private static GUIStyle _buttonStyle;
         private static GUIStyle _labelStyle;
@@ -1776,17 +2638,22 @@ namespace AUGLMod
         private static GUIStyle _linkButtonStyle;
         private static GUIStyle _titleStyle;
         private static GUIStyle _paragraphStyle;
+        private static GUIStyle _activePillStyle;
+        private static GUIStyle _glitchedPillStyle;
+        private static GUIStyle _regionCardBoxStyle;
+        private static GUIStyle _headerTitleStyle;
+        private static GUIStyle _statsBarStyle;
 
         private static void InitStyles()
         {
-            if (_initialized && _winBgTex != null && _btnNormTex != null && _boxBgTex != null && _activeTextFieldBgTex != null)
+            if (_initialized && _winBgTex != null && _btnNormTex != null && _boxBgTex != null && _activeTextFieldBgTex != null && _pillNormTex != null)
             {
                 return;
             }
 
             if (Screen.width > 0 && Screen.height > 0)
             {
-                _windowRect = new Rect((Screen.width - 780) / 2, (Screen.height - 520) / 2, 780, 520);
+                _windowRect = new Rect((Screen.width - 860) / 2, (Screen.height - 540) / 2, 860, 540);
             }
 
             _winBgTex = MakeTex(new Color(0.07f, 0.07f, 0.10f, 0.97f));
@@ -1795,6 +2662,11 @@ namespace AUGLMod
             _btnHoverTex = MakeTex(new Color(0.25f, 0.25f, 0.35f, 1f));
             _textFieldBgTex = MakeTex(new Color(0.05f, 0.05f, 0.07f, 1f));
             _activeTextFieldBgTex = MakeTex(new Color(0.12f, 0.22f, 0.40f, 1f));
+            _pillNormTex = MakeTex(new Color(0.16f, 0.16f, 0.20f, 1f));
+            _pillHoverTex = MakeTex(new Color(0.24f, 0.32f, 0.45f, 1f));
+            _glitchedPillNormTex = MakeTex(new Color(0.08f, 0.22f, 0.12f, 1f));
+            _glitchedPillHoverTex = MakeTex(new Color(0.12f, 0.38f, 0.20f, 1f));
+            _regionCardBgTex = MakeTex(new Color(0.09f, 0.09f, 0.12f, 0.95f));
 
             _winBgTex.hideFlags = HideFlags.DontSave;
             _boxBgTex.hideFlags = HideFlags.DontSave;
@@ -1802,6 +2674,11 @@ namespace AUGLMod
             _btnHoverTex.hideFlags = HideFlags.DontSave;
             _textFieldBgTex.hideFlags = HideFlags.DontSave;
             _activeTextFieldBgTex.hideFlags = HideFlags.DontSave;
+            _pillNormTex.hideFlags = HideFlags.DontSave;
+            _pillHoverTex.hideFlags = HideFlags.DontSave;
+            _glitchedPillNormTex.hideFlags = HideFlags.DontSave;
+            _glitchedPillHoverTex.hideFlags = HideFlags.DontSave;
+            _regionCardBgTex.hideFlags = HideFlags.DontSave;
 
             _windowStyle = new GUIStyle(GUI.skin.window) { fontSize = 14, fontStyle = FontStyle.Bold };
             _windowStyle.normal.background = _winBgTex;
@@ -1852,6 +2729,27 @@ namespace AUGLMod
             _paragraphStyle = new GUIStyle(GUI.skin.label) { fontSize = 12, wordWrap = true };
             _paragraphStyle.normal.textColor = new Color(0.9f, 0.9f, 0.95f);
 
+            _activePillStyle = new GUIStyle(GUI.skin.button) { fontSize = 11, fontStyle = FontStyle.Bold, alignment = TextAnchor.MiddleCenter };
+            _activePillStyle.normal.background = _pillNormTex;
+            _activePillStyle.normal.textColor = new Color(0.92f, 0.92f, 0.95f);
+            _activePillStyle.hover.background = _pillHoverTex;
+            _activePillStyle.hover.textColor = Color.cyan;
+
+            _glitchedPillStyle = new GUIStyle(GUI.skin.button) { fontSize = 11, fontStyle = FontStyle.Bold, alignment = TextAnchor.MiddleCenter };
+            _glitchedPillStyle.normal.background = _glitchedPillNormTex;
+            _glitchedPillStyle.normal.textColor = new Color(0.1f, 1f, 0.4f);
+            _glitchedPillStyle.hover.background = _glitchedPillHoverTex;
+            _glitchedPillStyle.hover.textColor = Color.yellow;
+
+            _regionCardBoxStyle = new GUIStyle(GUI.skin.box);
+            _regionCardBoxStyle.normal.background = _regionCardBgTex;
+
+            _headerTitleStyle = new GUIStyle(GUI.skin.label) { fontSize = 22, fontStyle = FontStyle.Bold, alignment = TextAnchor.MiddleCenter };
+            _headerTitleStyle.normal.textColor = Color.white;
+
+            _statsBarStyle = new GUIStyle(GUI.skin.label) { fontSize = 12, alignment = TextAnchor.MiddleCenter };
+            _statsBarStyle.normal.textColor = new Color(0.85f, 0.85f, 0.90f);
+
             _initialized = true;
         }
 
@@ -1880,7 +2778,16 @@ namespace AUGLMod
             try
             {
                 _status = "Fetching...";
-                _codes = await AUGLApiClient.FetchCodesAsync();
+                var (codes, stats) = await AUGLApiClient.FetchDataAsync();
+                _codes = codes ?? new List<GlitchedCodeResponse>();
+                _apiStats = stats ?? new GlitchedStatsResponse();
+
+                if (_apiStats.Total_Codes == 0 && _codes.Count > 0)
+                {
+                    _apiStats.Total_Codes = _codes.Count;
+                    _apiStats.Glitched = _codes.Count(c => c.Glitched);
+                }
+
                 _status = _codes.Count > 0 ? $"Active ({_codes.Count} codes)" : "No active codes";
             }
             catch
@@ -1899,24 +2806,36 @@ namespace AUGLMod
             return list;
         }
 
+        private static Type _lobbyClientTypeCache;
+        private static PropertyInfo _lobbyInstPropCache;
+        private static PropertyInfo _lobbyGameIdPropCache;
+        private static Type _gameCodeTypeCache;
+        private static MethodInfo _intToGameNameMethodCache;
+        private static bool _lobbyCodeLookupDone;
+
         public static string GetCurrentLobbyCode()
         {
             try
             {
-                var clientType = AccessTools.TypeByName("AmongUsClient");
-                var instProp = clientType?.GetProperty("Instance");
-                var client = instProp?.GetValue(null);
+                if (!_lobbyCodeLookupDone)
+                {
+                    _lobbyClientTypeCache = AccessTools.TypeByName("AmongUsClient");
+                    _lobbyInstPropCache = _lobbyClientTypeCache?.GetProperty("Instance");
+                    _lobbyGameIdPropCache = _lobbyClientTypeCache?.GetProperty("GameId") ?? _lobbyClientTypeCache?.GetProperty("gameId");
+                    _gameCodeTypeCache = AccessTools.TypeByName("GameCode") ?? AccessTools.TypeByName("InnerNet.GameCode");
+                    _intToGameNameMethodCache = AccessTools.Method(_gameCodeTypeCache, "IntToGameName", new Type[] { typeof(int) });
+                    _lobbyCodeLookupDone = true;
+                }
+
+                var client = _lobbyInstPropCache?.GetValue(null);
                 if (client == null) return null;
 
-                var gameIdProp = clientType.GetProperty("GameId") ?? clientType.GetProperty("gameId");
-                int gameId = (int)(gameIdProp?.GetValue(client) ?? 0);
+                int gameId = (int)(_lobbyGameIdPropCache?.GetValue(client) ?? 0);
                 if (gameId == 0) return null;
 
-                var gameCodeType = AccessTools.TypeByName("GameCode") ?? AccessTools.TypeByName("InnerNet.GameCode");
-                var intToGameNameMethod = AccessTools.Method(gameCodeType, "IntToGameName", new Type[] { typeof(int) });
-                if (intToGameNameMethod != null)
+                if (_intToGameNameMethodCache != null)
                 {
-                    return (string)intToGameNameMethod.Invoke(null, new object[] { gameId });
+                    return (string)_intToGameNameMethodCache.Invoke(null, new object[] { gameId });
                 }
 
                 return DecodeGameCode(gameId);
@@ -1970,48 +2889,6 @@ namespace AUGLMod
             return false;
         }
 
-        public static void AutoJoinGlitchedLobby()
-        {
-            try
-            {
-                var glitched = GetGlitchedCodesList();
-                if (glitched.Count == 0)
-                {
-                    _ = FetchCodes();
-                    return;
-                }
-
-                var chosen = glitched[UnityEngine.Random.Range(0, glitched.Count)];
-                string codeStr = chosen.Code.Trim().ToUpper();
-                GUIUtility.systemCopyBuffer = codeStr;
-                TriggerToast($"Connecting to {codeStr}...");
-
-                var matchMakerType = AccessTools.TypeByName("MatchMaker");
-                var mmInstProp = matchMakerType?.GetProperty("Instance");
-                var mm = mmInstProp?.GetValue(null);
-
-                if (mm != null)
-                {
-                    var joinStrMethod = AccessTools.Method(matchMakerType, "JoinGameFromCode", new Type[] { typeof(string) });
-                    if (joinStrMethod != null)
-                    {
-                        joinStrMethod.Invoke(mm, new object[] { codeStr });
-                        return;
-                    }
-                }
-
-                var gameCodeType = AccessTools.TypeByName("GameCode") ?? AccessTools.TypeByName("InnerNet.GameCode");
-                var gameNameToInt = AccessTools.Method(gameCodeType, "GameNameToInt", new Type[] { typeof(string) });
-                if (gameNameToInt != null && mm != null)
-                {
-                    int intCode = (int)gameNameToInt.Invoke(null, new object[] { codeStr });
-                    var joinIntMethod = AccessTools.Method(matchMakerType, "JoinGameFromCode", new Type[] { typeof(int) });
-                    joinIntMethod?.Invoke(mm, new object[] { intCode });
-                }
-            }
-            catch { }
-        }
-
         public static void DrawGlitchBadgeHUD()
         {
             try
@@ -2039,6 +2916,12 @@ namespace AUGLMod
             catch { }
         }
 
+        private static Type _clientTypeCache;
+        private static PropertyInfo _instancePropCache;
+        private static FieldInfo _pingFieldCache;
+        private static PropertyInfo _pingPropCache;
+        private static bool _pingLookupDone;
+
         public static void DrawFpsPingHUD()
         {
             try
@@ -2046,14 +2929,22 @@ namespace AUGLMod
                 InitStyles();
                 int fps = (int)(1.0f / Mathf.Max(0.0001f, Time.smoothDeltaTime));
                 int ping = 0;
-                var clientType = AccessTools.TypeByName("AmongUsClient");
-                var inst = clientType?.GetProperty("Instance")?.GetValue(null);
+
+                if (!_pingLookupDone)
+                {
+                    _clientTypeCache = AccessTools.TypeByName("AmongUsClient");
+                    _instancePropCache = _clientTypeCache?.GetProperty("Instance");
+                    _pingFieldCache = AccessTools.Field(_clientTypeCache, "Ping");
+                    if (_pingFieldCache == null)
+                        _pingPropCache = AccessTools.Property(_clientTypeCache, "Ping");
+                    _pingLookupDone = true;
+                }
+
+                var inst = _instancePropCache?.GetValue(null);
                 if (inst != null)
                 {
-                    var pingF = AccessTools.Field(clientType, "Ping");
-                    var pingP = AccessTools.Property(clientType, "Ping");
-                    if (pingF != null) ping = (int)(pingF.GetValue(inst) ?? 0);
-                    else if (pingP != null) ping = (int)(pingP.GetValue(inst) ?? 0);
+                    if (_pingFieldCache != null) ping = (int)(_pingFieldCache.GetValue(inst) ?? 0);
+                    else if (_pingPropCache != null) ping = (int)(_pingPropCache.GetValue(inst) ?? 0);
                 }
 
                 Rect fpsRect = new Rect(10, 10, 150, 24);
@@ -2068,9 +2959,7 @@ namespace AUGLMod
         {
             try
             {
-                var meetingType = AccessTools.TypeByName("MeetingHud");
-                var instProp = meetingType?.GetProperty("Instance");
-                var meeting = instProp?.GetValue(null);
+                var meeting = MeetingHud.Instance;
                 if (meeting == null || MeetingVoteRevealerPatch.LiveVotes.Count == 0) return;
 
                 InitStyles();
@@ -2079,31 +2968,24 @@ namespace AUGLMod
                 GUI.Label(new Rect(hudRect.x + 8, hudRect.y + 4, hudRect.width - 16, 20), "🗳️ <b>Live Votes Tracker:</b>", _boldLabelStyle);
 
                 int index = 0;
-                var playerControlType = AccessTools.TypeByName("PlayerControl");
-                var allPlayersField = AccessTools.Field(playerControlType, "AllPlayerControls");
-                var allPlayersList = allPlayersField?.GetValue(null) as IEnumerable;
+                var allPlayers = PlayerControl.AllPlayerControls;
+                Dictionary<byte, string> nameMap = new Dictionary<byte, string>();
+                if (allPlayers != null)
+                {
+                    for (int i = 0; i < allPlayers.Count; i++)
+                    {
+                        var p = allPlayers[i];
+                        if (p != null && p.Data != null)
+                        {
+                            nameMap[p.Data.PlayerId] = p.Data.PlayerName;
+                        }
+                    }
+                }
 
                 string GetPlayerName(byte id)
                 {
                     if (id == 254 || id == 255) return "Skipped Vote";
-                    if (allPlayersList != null)
-                    {
-                        foreach (var p in allPlayersList)
-                        {
-                            var dataProp = AccessTools.Property(p.GetType(), "Data");
-                            var data = dataProp?.GetValue(p);
-                            if (data != null)
-                            {
-                                var pIdField = AccessTools.Field(data.GetType(), "PlayerId");
-                                byte curId = (byte)(pIdField?.GetValue(data) ?? 255);
-                                if (curId == id)
-                                {
-                                    var nameField = AccessTools.Field(data.GetType(), "PlayerName");
-                                    return (string)(nameField?.GetValue(data) ?? $"Player {id}");
-                                }
-                            }
-                        }
-                    }
+                    if (nameMap.TryGetValue(id, out string n)) return n;
                     return $"Player {id}";
                 }
 
@@ -2119,17 +3001,20 @@ namespace AUGLMod
             catch { }
         }
 
+        private static bool _isMedbayScanning = false;
+
         public static void TriggerMedBayScan()
         {
             try
             {
-                var localPlayerProp = AccessTools.Property(AccessTools.TypeByName("PlayerControl"), "LocalPlayer");
-                var localPlayer = localPlayerProp?.GetValue(null);
-                if (localPlayer == null) return;
+                var lp = PlayerControl.LocalPlayer;
+                if (lp == null) return;
 
-                var setScannerMethod = AccessTools.Method(localPlayer.GetType(), "SetScanner") ?? AccessTools.Method(localPlayer.GetType(), "RpcSetScanner");
-                setScannerMethod?.Invoke(localPlayer, new object[] { true });
-                TriggerToast("MedBay Scan Activated Anywhere!");
+                _isMedbayScanning = !_isMedbayScanning;
+                lp.SetScanner(_isMedbayScanning, 0);
+                lp.RpcSetScanner(_isMedbayScanning);
+
+                TriggerToast(_isMedbayScanning ? "MedBay Scan: ACTIVATED" : "MedBay Scan: CANCELLED");
             }
             catch { }
         }
@@ -2164,48 +3049,46 @@ namespace AUGLMod
 
             InitStyles();
 
-            _windowRect = GUI.Window(0, _windowRect, (GUI.WindowFunction)DrawWindow, "AUGL Menu v1.9.21 (Ultimate Edition)", _windowStyle);
+            _windowRect = GUI.Window(0, _windowRect, (GUI.WindowFunction)DrawWindow, "AUGL Menu 04.09.18", _windowStyle);
         }
 
         private static void DrawWindow(int id)
         {
-            GUI.DragWindow(new Rect(0, 0, 780, 25));
+            GUI.DragWindow(new Rect(0, 0, 860, 25));
 
             GUILayout.BeginHorizontal();
-            if (GUILayout.Button("About", _buttonStyle, GUILayout.Width(95), GUILayout.Height(26))) SwitchTab(0);
-            if (GUILayout.Button("Active Codes", _buttonStyle, GUILayout.Width(95), GUILayout.Height(26))) SwitchTab(1);
-            if (GUILayout.Button("Glitched Codes", _buttonStyle, GUILayout.Width(100), GUILayout.Height(26))) SwitchTab(2);
-            if (GUILayout.Button("Unlockers", _buttonStyle, GUILayout.Width(90), GUILayout.Height(26))) SwitchTab(3);
-            if (GUILayout.Button("Host & Modes", _buttonStyle, GUILayout.Width(105), GUILayout.Height(26))) SwitchTab(4);
-            if (GUILayout.Button("Fun AddOns", _buttonStyle, GUILayout.Width(95), GUILayout.Height(26))) SwitchTab(5);
-            if (GUILayout.Button("Troll", _buttonStyle, GUILayout.Width(75), GUILayout.Height(26))) SwitchTab(6);
-            if (GUILayout.Button("Docs", _buttonStyle, GUILayout.Width(65), GUILayout.Height(26))) SwitchTab(7);
+            if (GUILayout.Button("About", _buttonStyle, GUILayout.Width(70), GUILayout.Height(26))) SwitchTab(0);
+            if (GUILayout.Button("Glitched Lobbies", _buttonStyle, GUILayout.Width(115), GUILayout.Height(26))) SwitchTab(1);
+            if (GUILayout.Button("Unlockers", _buttonStyle, GUILayout.Width(75), GUILayout.Height(26))) SwitchTab(3);
+            if (GUILayout.Button("Host & Modes", _buttonStyle, GUILayout.Width(90), GUILayout.Height(26))) SwitchTab(4);
+            if (GUILayout.Button("Players", _buttonStyle, GUILayout.Width(70), GUILayout.Height(26))) SwitchTab(8);
+            if (GUILayout.Button("Fun AddOns", _buttonStyle, GUILayout.Width(85), GUILayout.Height(26))) SwitchTab(5);
+            if (GUILayout.Button("Troll", _buttonStyle, GUILayout.Width(50), GUILayout.Height(26))) SwitchTab(6);
+            if (GUILayout.Button("Docs", _buttonStyle, GUILayout.Width(50), GUILayout.Height(26))) SwitchTab(7);
             GUILayout.EndHorizontal();
             GUILayout.Space(10);
 
+            _scroll = GUILayout.BeginScrollView(_scroll, GUILayout.Width(830), GUILayout.Height(450));
             try
             {
-                _scroll = GUILayout.BeginScrollView(_scroll, GUILayout.Width(750), GUILayout.Height(420));
                 switch (_tab)
                 {
                     case 0: DrawAbout(); break;
-                    case 1: DrawCodes(false); break;
-                    case 2: DrawCodes(true); break;
+                    case 1: DrawGlitchedLobbiesTab(); break;
                     case 3: DrawUnlocker(); break;
                     case 4: DrawHostAndModes(); break;
                     case 5: DrawFunAddOns(); break;
                     case 6: DrawTrollTab(); break;
                     case 7: DrawDocs(); break;
+                    case 8: DrawPlayersTab(); break;
                 }
             }
             catch (Exception ex)
             {
+                if (ex.GetType().Name == "ExitGUIException") throw;
                 AUGLModPlugin.Log?.LogWarning($"Tab drawing exception: {ex.Message}");
             }
-            finally
-            {
-                GUILayout.EndScrollView();
-            }
+            GUILayout.EndScrollView();
         }
 
         private static void SwitchTab(int tabIndex)
@@ -2298,8 +3181,8 @@ namespace AUGLMod
         private static void DrawAbout()
         {
             GUILayout.Label("AUGL Menu", _boldLabelStyle);
-            GUILayout.Label("Version: 01092026.v21 (Ultimate Edition)", _labelStyle);
-            GUILayout.Label("Version Date: 01/09/2026", _labelStyle);
+            GUILayout.Label("Version: 04.09.18", _labelStyle);
+            GUILayout.Label("Version Build Date: 04/09/2026", _labelStyle);
             GUILayout.Label("Creators: sparxist (original), auratech0 (menu)", _labelStyle);
             GUILayout.Space(8);
 
@@ -2348,94 +3231,244 @@ namespace AUGLMod
             GUILayout.Space(10);
             GUILayout.Label($"Status: {_status}", _labelStyle);
             
+            GUILayout.BeginHorizontal();
             if (GUILayout.Button("Refresh Codes Now", _buttonStyle, GUILayout.Width(150), GUILayout.Height(24)))
             {
                 _ = FetchCodes();
             }
 
-            Rect eggRect = new Rect(730 - 60, 520 - 50, 50, 20);
-            if (GUI.Button(eggRect, _eggClicks >= _eggTexts.Length ? "🐱" : _eggTexts[_eggClicks], _buttonStyle))
+            // Easter Egg Button inside normal flow so it is never clipped
+            string eggText = _eggClicks >= _eggTexts.Length ? "🐱" : _eggTexts[_eggClicks];
+            if (GUILayout.Button(eggText, _buttonStyle, GUILayout.Width(90), GUILayout.Height(24)))
             {
                 _eggClicks = Mathf.Min(_eggClicks + 1, _eggTexts.Length);
-                if (_eggClicks == _eggTexts.Length) LoadEgg();
+                if (_eggClicks == _eggTexts.Length)
+                {
+                    LoadEgg();
+                }
             }
-            if (_eggClicks >= _eggTexts.Length && _eggTex) GUI.DrawTexture(new Rect(730 - 70, 520 - 80, 60, 60), _eggTex);
+            GUILayout.EndHorizontal();
+
+            // Render Easter Egg Texture inside tab layout
+            if (_eggClicks >= _eggTexts.Length && _eggTex != null)
+            {
+                GUILayout.Space(6);
+                Rect texRect = GUILayoutUtility.GetRect(64, 64, GUILayout.ExpandWidth(false));
+                GUI.DrawTexture(texRect, _eggTex, ScaleMode.ScaleToFit);
+            }
         }
 
         private static void LoadEgg()
         {
-            try { _eggTex = new Texture2D(2, 2); _eggTex.LoadImage(Convert.FromBase64String(_eggB64)); } catch { }
+            try
+            {
+                if (_eggTex == null)
+                {
+                    byte[] pngBytes = Convert.FromBase64String(_eggB64.Trim());
+                    _eggTex = new Texture2D(2, 2, TextureFormat.RGBA32, false);
+                    _eggTex.LoadImage(pngBytes);
+                    _eggTex.hideFlags = HideFlags.DontSave;
+                }
+            }
+            catch (Exception ex)
+            {
+                AUGLModPlugin.Log?.LogWarning($"Egg load failed: {ex.Message}");
+            }
         }
 
-        private static void DrawCodes(bool glitchedOnly)
+        private static GUIStyle _boldCenterLabelStyle;
+        private static GUIStyle _centerLabelStyle;
+
+        private static void RebuildRegionalCache()
         {
-            GUILayout.Label(glitchedOnly ? "Glitched Codes" : "Active Codes", _boldLabelStyle);
-            GUILayout.Space(4);
-
-            GUILayout.BeginHorizontal();
-            GUILayout.Label("🔍 Search Code:", _labelStyle, GUILayout.Width(100));
-            _searchQuery = GUILayout.TextField(_searchQuery, GUILayout.Width(180));
-            if (GUILayout.Button("Clear", _buttonStyle, GUILayout.Width(60))) _searchQuery = "";
-            GUILayout.EndHorizontal();
-            GUILayout.Space(6);
-
-            List<GlitchedCodeResponse> list = new List<GlitchedCodeResponse>();
             string query = (_searchQuery ?? "").Trim().ToUpper();
-
-            foreach (var c in _codes)
+            if (query == _lastCachedQuery && _codes.Count == _lastCachedCodesCount && (DateTime.UtcNow - _lastCacheTime).TotalSeconds < 2.0)
             {
-                if (glitchedOnly && !c.Glitched) continue;
-                if (!glitchedOnly && c.Glitched) continue;
-                if (!string.IsNullOrEmpty(query) && !c.Code.ToUpper().Contains(query)) continue;
-                list.Add(c);
-            }
-
-            if (glitchedOnly && list.Count > 0)
-            {
-                if (GUILayout.Button("🚀 Auto-Hop / Join Random Glitched Lobby", _buttonStyle, GUILayout.Width(300), GUILayout.Height(28)))
-                {
-                    AutoJoinGlitchedLobby();
-                }
-                GUILayout.Space(6);
-            }
-
-            if (list.Count == 0)
-            {
-                if (glitchedOnly) GUILayout.Label("⚠ No glitched code was found, please try again later.", _boldLabelStyle);
-                else GUILayout.Label("No active codes available. Try refreshing from About tab.", _labelStyle);
                 return;
             }
 
-            float rowHeight = 34f;
-            int firstVisible = Mathf.Max(0, (int)(_scroll.y / rowHeight));
-            int visibleCount = (int)(400f / rowHeight) + 2;
-            int lastVisible = Mathf.Min(list.Count, firstVisible + visibleCount);
+            _lastCachedQuery = query;
+            _lastCachedCodesCount = _codes.Count;
+            _lastCacheTime = DateTime.UtcNow;
 
-            if (firstVisible > 0)
+            _naGlitched.Clear(); _naActive.Clear();
+            _euGlitched.Clear(); _euActive.Clear();
+            _asGlitched.Clear(); _asActive.Clear();
+
+            int maxActivePerRegion = 84;
+
+            for (int i = 0; i < _codes.Count; i++)
             {
-                GUILayout.Space(firstVisible * rowHeight);
+                var c = _codes[i];
+                if (c == null || c.Dormant || string.IsNullOrEmpty(c.Code)) continue;
+                if (!string.IsNullOrEmpty(query) && !c.Code.ToUpper().Contains(query)) continue;
+
+                string reg = (c.Region ?? "na").Trim().ToLower();
+                if (reg == "na")
+                {
+                    if (c.Glitched) _naGlitched.Add(c);
+                    else if (_naActive.Count < maxActivePerRegion) _naActive.Add(c);
+                }
+                else if (reg == "eu")
+                {
+                    if (c.Glitched) _euGlitched.Add(c);
+                    else if (_euActive.Count < maxActivePerRegion) _euActive.Add(c);
+                }
+                else if (reg == "as")
+                {
+                    if (c.Glitched) _asGlitched.Add(c);
+                    else if (_asActive.Count < maxActivePerRegion) _asActive.Add(c);
+                }
+            }
+        }
+
+        private static void DrawGlitchedLobbiesTab()
+        {
+            if (_boldCenterLabelStyle == null)
+            {
+                _boldCenterLabelStyle = new GUIStyle(_boldLabelStyle) { alignment = TextAnchor.MiddleCenter };
+                _centerLabelStyle = new GUIStyle(_labelStyle) { alignment = TextAnchor.MiddleCenter };
             }
 
-            for (int i = firstVisible; i < lastVisible; i++)
+            RebuildRegionalCache();
+
+            // Title Header (GLITCHED LOBBIES)
+            GUILayout.BeginHorizontal();
+            GUILayout.FlexibleSpace();
+            GUILayout.Label("GLITCHED LOBBIES", _headerTitleStyle);
+            GUILayout.FlexibleSpace();
+            GUILayout.EndHorizontal();
+
+            GUILayout.Space(2);
+
+            // Stats Subheader Bar
+            int glitchedCount = _apiStats.Glitched > 0 ? _apiStats.Glitched : (_naGlitched.Count + _euGlitched.Count + _asGlitched.Count);
+            int codesPerMin = _apiStats.CodesPerMin;
+            int totalCodes = _apiStats.Total_Codes > 0 ? _apiStats.Total_Codes : _codes.Count;
+
+            GUILayout.BeginHorizontal();
+            GUILayout.FlexibleSpace();
+            GUILayout.Label($"💥 <b>Glitched Codes:</b> <color=#00FF66>{glitchedCount}</color>    🔍 <b>Codes found in last minute:</b> {codesPerMin}    👁 <b>Total active codes:</b> {totalCodes}", _statsBarStyle);
+            GUILayout.FlexibleSpace();
+            GUILayout.EndHorizontal();
+
+            GUILayout.Space(10);
+
+            // Search Bar & Controls
+            GUILayout.BeginHorizontal();
+            GUILayout.Label("🔍 Search Code:", _labelStyle, GUILayout.Width(100));
+            string oldQuery = _searchQuery;
+            _searchQuery = DrawCustomInputField("codeSearch", _searchQuery, 160f);
+            if (oldQuery != _searchQuery) _lastCachedQuery = null;
+
+            if (GUILayout.Button("Clear", _buttonStyle, GUILayout.Width(50), GUILayout.Height(24)))
             {
-                var c = list[i];
-                GUILayout.BeginHorizontal(_boxStyle, GUILayout.Height(30));
-                if (c.Glitched) GUILayout.Label("[GLITCHED] " + c.Code, _glitchedLabelStyle, GUILayout.Width(250));
-                else GUILayout.Label(c.Code, _labelStyle, GUILayout.Width(250));
-                GUILayout.FlexibleSpace();
-                GUILayout.Label("Port: " + c.Port, _labelStyle, GUILayout.Width(100));
-                if (GUILayout.Button("Copy", _buttonStyle, GUILayout.Width(60), GUILayout.Height(22)))
+                _searchQuery = "";
+                _lastCachedQuery = null;
+            }
+            GUILayout.FlexibleSpace();
+            if (GUILayout.Button("🔄 Refresh", _buttonStyle, GUILayout.Width(80), GUILayout.Height(24)))
+            {
+                _lastCachedQuery = null;
+                _ = FetchCodes();
+            }
+            GUILayout.EndHorizontal();
+
+            GUILayout.Space(12);
+
+            // 3 Columns: North America, Europe, Asia
+            GUILayout.BeginHorizontal();
+            DrawRegionCard("North America", _naGlitched, _naActive);
+            GUILayout.Space(10);
+            DrawRegionCard("Europe", _euGlitched, _euActive);
+            GUILayout.Space(10);
+            DrawRegionCard("Asia", _asGlitched, _asActive);
+            GUILayout.EndHorizontal();
+        }
+
+        private static void DrawRegionCard(string regionTitle, List<GlitchedCodeResponse> glitchedCodes, List<GlitchedCodeResponse> activeCodes)
+        {
+            int glitchedRows = (glitchedCodes != null && glitchedCodes.Count > 0) ? (int)Math.Ceiling(glitchedCodes.Count / 3.0) : 1;
+            int activeRows = (activeCodes != null && activeCodes.Count > 0) ? (int)Math.Ceiling(activeCodes.Count / 3.0) : 1;
+
+            float cardHeight = 30 + 22 + (glitchedRows * 27) + 24 + (activeRows * 27) + 12;
+            Rect cardRect = GUILayoutUtility.GetRect(255f, cardHeight, GUILayout.ExpandWidth(false));
+
+            GUI.Box(cardRect, GUIContent.none, _regionCardBoxStyle);
+
+            float curY = cardRect.y + 6;
+
+            // Region Name Title
+            GUI.Label(new Rect(cardRect.x, curY, cardRect.width, 22), $"<b><size=14>{regionTitle}</size></b>", _boldCenterLabelStyle);
+            curY += 26;
+
+            // Glitched Header
+            GUI.Label(new Rect(cardRect.x, curY, cardRect.width, 20), "<b><color=#00FF66>Glitched</color></b>", _boldCenterLabelStyle);
+            curY += 22;
+
+            if (glitchedCodes == null || glitchedCodes.Count == 0)
+            {
+                GUI.Label(new Rect(cardRect.x, curY, cardRect.width, 20), "<color=#777777><size=11>Nothing found!</size></color>", _centerLabelStyle);
+                curY += 24;
+            }
+            else
+            {
+                curY = DrawDirectPillGrid(cardRect.x + 12, curY, glitchedCodes, true);
+            }
+
+            curY += 6;
+
+            // Active Header
+            GUI.Label(new Rect(cardRect.x, curY, cardRect.width, 20), "<b><color=#CCCCCC>Active</color></b>", _boldCenterLabelStyle);
+            curY += 22;
+
+            if (activeCodes == null || activeCodes.Count == 0)
+            {
+                GUI.Label(new Rect(cardRect.x, curY, cardRect.width, 20), "<color=#777777><size=11>Nothing found!</size></color>", _centerLabelStyle);
+            }
+            else
+            {
+                DrawDirectPillGrid(cardRect.x + 12, curY, activeCodes, false);
+            }
+        }
+
+        private static float DrawDirectPillGrid(float startX, float startY, List<GlitchedCodeResponse> codeList, bool isGlitched)
+        {
+            GUIStyle pillStyle = isGlitched ? _glitchedPillStyle : _activePillStyle;
+            float curX = startX;
+            float curY = startY;
+            int countInRow = 0;
+
+            for (int i = 0; i < codeList.Count; i++)
+            {
+                var c = codeList[i];
+                Rect pillRect = new Rect(curX, curY, 74, 24);
+
+                if (GUI.Button(pillRect, c.Code, pillStyle))
                 {
                     GUIUtility.systemCopyBuffer = c.Code;
-                    TriggerToast($"Copied: {c.Code}");
+                    TriggerToast($"Copied {c.Code} ({(c.Region ?? "NA").ToUpper()})");
                 }
-                GUILayout.EndHorizontal();
+
+                countInRow++;
+                if (countInRow >= 3)
+                {
+                    countInRow = 0;
+                    curX = startX;
+                    curY += 27;
+                }
+                else
+                {
+                    curX += 78;
+                }
             }
 
-            if (lastVisible < list.Count)
+            if (countInRow > 0)
             {
-                GUILayout.Space((list.Count - lastVisible) * rowHeight);
+                curY += 27;
             }
+
+            return curY;
         }
 
         private static void DrawUnlocker()
@@ -2516,6 +3549,11 @@ namespace AUGLMod
 
         private static void DrawHostAndModes()
         {
+            GUILayout.BeginHorizontal();
+
+            // Left Column: Original Host QoL, Anti-Cheat, & Presets (480px)
+            GUILayout.BeginVertical(GUILayout.Width(480));
+
             GUILayout.Label("Host Quality-of-Life Tools", _boldLabelStyle);
             GUILayout.Space(4);
             GUILayout.Label($"<b>Active Mode Status:</b> <color=#00FF66>{GameModePresetManager.ActiveModeName}</color>", _labelStyle);
@@ -2542,27 +3580,138 @@ namespace AUGLMod
             HostQoLManager.ImpLight = GUILayout.HorizontalSlider(HostQoLManager.ImpLight, 0.2f, 5.0f, GUILayout.Width(280));
 
             GUILayout.Space(8);
-            if (GUILayout.Button("Apply Host Options", _buttonStyle, GUILayout.Width(150), GUILayout.Height(26)))
+            GUILayout.BeginHorizontal();
+            if (GUILayout.Button("Apply Host Options", _buttonStyle, GUILayout.Width(140), GUILayout.Height(26)))
             {
                 HostQoLManager.ApplyHostSettings();
             }
 
-            GUILayout.Space(16);
-            GUILayout.Label("Remote Door Controls (Host-Only):", _boldLabelStyle);
-            GUILayout.BeginHorizontal();
-            if (GUILayout.Button("Lock Cafeteria", _buttonStyle, GUILayout.Width(110), GUILayout.Height(24))) HostQoLManager.TriggerRemoteDoor(14, true);
-            if (GUILayout.Button("Lock MedBay", _buttonStyle, GUILayout.Width(100), GUILayout.Height(24))) HostQoLManager.TriggerRemoteDoor(14, true);
-            if (GUILayout.Button("Lock Electrical", _buttonStyle, GUILayout.Width(110), GUILayout.Height(24))) HostQoLManager.TriggerRemoteDoor(14, true);
-            if (GUILayout.Button("Lock Storage", _buttonStyle, GUILayout.Width(100), GUILayout.Height(24))) HostQoLManager.TriggerRemoteDoor(14, true);
+            bool canClickPlus25 = false;
+            try
+            {
+                var client = AmongUsClient.Instance;
+                if (client != null && client.AmHost)
+                {
+                    var isPubField = AccessTools.Field(client.GetType(), "_IsGamePublic_k__BackingField");
+                    bool isPub = (bool)(isPubField?.GetValue(client) ?? false);
+                    canClickPlus25 = isPub;
+                }
+            }
+            catch { }
+
+            GUI.enabled = canClickPlus25;
+            string plus25Text = canClickPlus25 ? "👥 +25 Lobby Cap (Vanilla Joinable)" : "👥 +25 Lobby (Host Public Lobby Only)";
+            if (GUILayout.Button(plus25Text, _buttonStyle, GUILayout.Width(255), GUILayout.Height(26)))
+            {
+                HostQoLManager.SetMaxPlayers25();
+                TriggerToast("Max Players set to 25!");
+            }
+            GUI.enabled = true;
             GUILayout.EndHorizontal();
+
+            GUILayout.Space(14);
+            GUILayout.Label("Anti-Cheat & Player Access Controls", _boldLabelStyle);
+            AntiCheatManager.Enabled = SafeToggle(AntiCheatManager.Enabled, "Enable Host Anti-Cheat (Blocks illegal kills/bans blacklisted)");
+
+            GUILayout.Space(6);
+            GUILayout.BeginHorizontal();
+            GUILayout.Label("Whitelist Friend:", _labelStyle, GUILayout.Width(105));
+            _whitelistInput = DrawCustomInputField("wlInput", _whitelistInput, 135f);
+            if (GUILayout.Button("Add Friend", _buttonStyle, GUILayout.Width(85), GUILayout.Height(24)))
+            {
+                if (!string.IsNullOrWhiteSpace(_whitelistInput))
+                {
+                    string friend = _whitelistInput.Trim();
+                    if (!AntiCheatManager.Whitelist.Contains(friend))
+                    {
+                        AntiCheatManager.Whitelist.Add(friend);
+                        ConfigManager.Current.Whitelist = AntiCheatManager.Whitelist;
+                        ConfigManager.SaveConfig();
+                        TriggerToast($"Whitelisted: {friend}");
+                    }
+                    _whitelistInput = "";
+                }
+            }
+            if (GUILayout.Button("Clear All", _buttonStyle, GUILayout.Width(65), GUILayout.Height(24)))
+            {
+                AntiCheatManager.Whitelist.Clear();
+                ConfigManager.Current.Whitelist = AntiCheatManager.Whitelist;
+                ConfigManager.SaveConfig();
+                TriggerToast("Whitelist cleared.");
+            }
+            GUILayout.EndHorizontal();
+            if (AntiCheatManager.Whitelist.Count > 0)
+            {
+                GUILayout.Label($"Whitelisted ({AntiCheatManager.Whitelist.Count}): <color=#00FF66>" + string.Join(", ", AntiCheatManager.Whitelist) + "</color>", _labelStyle);
+            }
+
+            GUILayout.Space(6);
+            GUILayout.BeginHorizontal();
+            GUILayout.Label("Blacklist Player:", _labelStyle, GUILayout.Width(105));
+            _blacklistInput = DrawCustomInputField("blInput", _blacklistInput, 135f);
+            if (GUILayout.Button("Ban/Block", _buttonStyle, GUILayout.Width(85), GUILayout.Height(24)))
+            {
+                if (!string.IsNullOrWhiteSpace(_blacklistInput))
+                {
+                    string target = _blacklistInput.Trim();
+                    if (!AntiCheatManager.Blacklist.Contains(target))
+                    {
+                        AntiCheatManager.Blacklist.Add(target);
+                        ConfigManager.Current.Blacklist = AntiCheatManager.Blacklist;
+                        ConfigManager.SaveConfig();
+                        TriggerToast($"Blacklisted: {target}");
+                    }
+                    _blacklistInput = "";
+                }
+            }
+            if (GUILayout.Button("Clear All", _buttonStyle, GUILayout.Width(65), GUILayout.Height(24)))
+            {
+                AntiCheatManager.Blacklist.Clear();
+                ConfigManager.Current.Blacklist = AntiCheatManager.Blacklist;
+                ConfigManager.SaveConfig();
+                TriggerToast("Blacklist cleared.");
+            }
+            GUILayout.EndHorizontal();
+            if (AntiCheatManager.Blacklist.Count > 0)
+            {
+                GUILayout.Label($"Blacklisted ({AntiCheatManager.Blacklist.Count}): <color=#FF4444>" + string.Join(", ", AntiCheatManager.Blacklist) + "</color>", _labelStyle);
+            }
 
             GUILayout.Space(16);
             GUILayout.Label("Game Mode Presets", _boldLabelStyle);
             GUILayout.Space(6);
             GUILayout.BeginHorizontal();
-            if (GUILayout.Button("Normal / Roles Galore", _buttonStyle, GUILayout.Width(160), GUILayout.Height(28))) GameModePresetManager.ApplyPreset("Normal");
-            if (GUILayout.Button("SNS (Shift & Seek)", _buttonStyle, GUILayout.Width(160), GUILayout.Height(28))) GameModePresetManager.ApplyPreset("SNS");
-            if (GUILayout.Button("Shields (Viper vs Angels)", _buttonStyle, GUILayout.Width(170), GUILayout.Height(28))) GameModePresetManager.ApplyPreset("Shields");
+            if (GUILayout.Button("Normal / Roles Galore", _buttonStyle, GUILayout.Width(150), GUILayout.Height(28))) GameModePresetManager.ApplyPreset("Normal");
+            if (GUILayout.Button("SNS (Shift & Seek)", _buttonStyle, GUILayout.Width(150), GUILayout.Height(28))) GameModePresetManager.ApplyPreset("SNS");
+            if (GUILayout.Button("Shields (Angels vs Killer)", _buttonStyle, GUILayout.Width(165), GUILayout.Height(28))) GameModePresetManager.ApplyPreset("Shields");
+            GUILayout.EndHorizontal();
+
+            GUILayout.EndVertical(); // End Left Column
+
+            GUILayout.Space(15);
+
+            // Right Column: New Match Controls (270px)
+            GUILayout.BeginVertical(GUILayout.Width(270));
+
+            GUILayout.Label("Match Controls", _boldLabelStyle);
+            GUILayout.Space(8);
+
+            if (GUILayout.Button("⚡ Force Start Game (Bypass Player Count)", _buttonStyle, GUILayout.Width(265), GUILayout.Height(34)))
+            {
+                DevTabManager.ForceStartGame();
+                TriggerToast("Force Start Triggered!");
+            }
+
+            GUILayout.Space(14);
+            DevTabManager.EnabledNoGameEnd = SafeToggle(DevTabManager.EnabledNoGameEnd, "No Game End (Infinite Match)");
+            GUILayout.Space(6);
+            if (DevTabManager.EnabledNoGameEnd)
+            {
+                GUILayout.Label("🔒 Matches will not terminate automatically when win conditions are met.", _paragraphStyle);
+            }
+
+            GUILayout.EndVertical(); // End Right Column
+
             GUILayout.EndHorizontal();
         }
 
@@ -2656,8 +3805,8 @@ namespace AUGLMod
             GUILayout.Space(12);
             GUILayout.Label("Local Teleportation:", _boldLabelStyle);
             GUILayout.BeginHorizontal();
-            if (GUILayout.Button("Teleport Out of Bounds", _buttonStyle, GUILayout.Width(180), GUILayout.Height(26))) ChatCommandsPatch.TeleportLocalPlayer(new Vector2(9999f, 9999f));
-            if (GUILayout.Button("Teleport to Center", _buttonStyle, GUILayout.Width(150), GUILayout.Height(26))) ChatCommandsPatch.TeleportLocalPlayer(Vector2.zero);
+            if (GUILayout.Button("Teleport Out of Bounds", _buttonStyle, GUILayout.Width(180), GUILayout.Height(26))) ChatCommandsPatch.TeleportLocalPlayer(new Vector2(-15f, 8f));
+            if (GUILayout.Button("Teleport to Center", _buttonStyle, GUILayout.Width(150), GUILayout.Height(26))) ChatCommandsPatch.TeleportLocalPlayer(new Vector2(0f, -0.5f));
             GUILayout.EndHorizontal();
 
             GUILayout.Space(12);
@@ -2695,7 +3844,6 @@ namespace AUGLMod
             GUILayout.BeginVertical(_boxStyle);
             GUILayout.Label("• <b>/codes</b> : List all active glitched lobby codes in chat\n" +
                             "• <b>/glitch</b> (or <b>/check</b>) : Check if current room is glitched\n" +
-                            "• <b>/autojoin</b> : Hop directly into an active glitched lobby\n" +
                             "• <b>/spoof</b> : Toggle PlayStation client spoofing\n" +
                             "• <b>/tpout /tpin</b> : Teleport outside / inside\n" +
                             "• <b>/menu</b> : Toggle this GUI menu\n" +
@@ -2715,11 +3863,184 @@ namespace AUGLMod
             _regionToggle = SafeToggle(_regionToggle, "Enable Region Injection");
             RegionInstaller.Enabled = _regionToggle;
             GUILayout.Space(4);
-            if (GUILayout.Button("Inject AUGL Region Now", _buttonStyle, GUILayout.Width(180), GUILayout.Height(24)))
+            GUILayout.BeginHorizontal();
+            if (GUILayout.Button("Verify Default Regions (Official + AUGL)", _buttonStyle, GUILayout.Width(270), GUILayout.Height(24)))
             {
-                RegionInstaller.Inject();
+                RegionInstaller.Inject(false);
+                TriggerToast("Verified Official + AUGL Regions!");
             }
+            if (GUILayout.Button("Inject Community Modded Servers (MEU/MNA/Niko)", _buttonStyle, GUILayout.Width(330), GUILayout.Height(24)))
+            {
+                RegionInstaller.Inject(true);
+                TriggerToast("Modded Servers Injected!");
+            }
+            GUILayout.EndHorizontal();
         }
+
+        private static Vector2 _playerListScroll = Vector2.zero;
+        private static Vector2 _playerActionScroll = Vector2.zero;
+
+        private static void DrawPlayersTab()
+        {
+            var players = PlayersTabManager.GetPlayers();
+            if (players.Count == 0)
+            {
+                GUILayout.Label("⚠ No players found in lobby/game.", _boldLabelStyle);
+                return;
+            }
+
+            if (PlayersTabManager.SelectedPlayerId == 255 || !players.Any(p => p != null && p.PlayerId == PlayersTabManager.SelectedPlayerId))
+            {
+                PlayersTabManager.SelectedPlayerId = players[0].PlayerId;
+            }
+
+            PlayerControl target = players.FirstOrDefault(p => p != null && p.PlayerId == PlayersTabManager.SelectedPlayerId) ?? players[0];
+
+            GUILayout.BeginHorizontal();
+
+            // Left column: player list
+            GUILayout.BeginVertical(GUILayout.Width(180));
+            GUILayout.Label("<b>Lobby Players:</b>", _boldLabelStyle);
+            _playerListScroll = GUILayout.BeginScrollView(_playerListScroll, GUILayout.Width(180), GUILayout.Height(370));
+
+            foreach (var pc in players)
+            {
+                if (pc == null || pc.Data == null) continue;
+                string pName = pc.Data.PlayerName ?? "???";
+                if (pc == PlayerControl.LocalPlayer) pName += " (You)";
+
+                if (PlayersTabManager.ForcedRoles.ContainsKey(pc.PlayerId))
+                    pName += " [" + PlayersTabManager.ForcedRoles[pc.PlayerId] + "]";
+
+                bool isSel = (pc.PlayerId == PlayersTabManager.SelectedPlayerId);
+                GUIStyle btnSt = isSel ? _activeTextFieldStyle : _buttonStyle;
+
+                if (GUILayout.Button(pName, btnSt, GUILayout.Height(26)))
+                {
+                    PlayersTabManager.SelectedPlayerId = pc.PlayerId;
+                }
+            }
+
+            GUILayout.EndScrollView();
+            GUILayout.EndVertical();
+
+            GUILayout.Space(12);
+
+            // Right column: selected player actions
+            GUILayout.BeginVertical();
+            _playerActionScroll = GUILayout.BeginScrollView(_playerActionScroll, GUILayout.Height(370));
+
+            if (target != null && target.Data != null)
+            {
+                GUILayout.Label($"<b>Selected Player:</b> <color=cyan>{target.Data.PlayerName}</color> (ID: {target.PlayerId})", _boldLabelStyle);
+                GUILayout.Space(8);
+
+                // Murder Loop
+                bool isMurderLoop = PlayersTabManager.PermanentMurderLoops.Contains(target.PlayerId);
+                string murderLoopLabel = isMurderLoop ? "● STOP Murder Loop" : "▶ START Murder Loop";
+                if (GUILayout.Button(murderLoopLabel, _buttonStyle, GUILayout.Width(220), GUILayout.Height(28)))
+                {
+                    if (isMurderLoop)
+                    {
+                        PlayersTabManager.PermanentMurderLoops.Remove(target.PlayerId);
+                        TriggerToast($"Murder Loop stopped for {target.Data.PlayerName}");
+                    }
+                    else
+                    {
+                        PlayersTabManager.PermanentMurderLoops.Add(target.PlayerId);
+                        TriggerToast($"Murder Loop started for {target.Data.PlayerName}");
+                    }
+                }
+
+                GUILayout.Space(6);
+
+                // 3. Permanent Shield
+                bool isPermShield = PlayersTabManager.PermanentShields.Contains(target.PlayerId);
+                string shieldLabel = isPermShield ? "🛡 SHIELD: ON (Click to Remove)" : "🛡 PROTECT (Permanent Shield)";
+                if (GUILayout.Button(shieldLabel, _buttonStyle, GUILayout.Width(260), GUILayout.Height(28)))
+                {
+                    PlayerControl local = PlayerControl.LocalPlayer;
+                    if (local != null)
+                    {
+                        if (isPermShield)
+                        {
+                            PlayersTabManager.PermanentShields.Remove(target.PlayerId);
+                            target.protectedByGuardianThisRound = false;
+                            target.protectedByGuardianId = -1;
+                            try { target.TurnOnProtection(false, 0, -1); } catch { }
+                            TriggerToast($"Shield removed for {target.Data.PlayerName}");
+                        }
+                        else
+                        {
+                            PlayersTabManager.PermanentShields.Add(target.PlayerId);
+                            int col = 0;
+                            try { col = (int)target.Data.DefaultOutfit.ColorId; } catch { }
+                            try { target.TurnOnProtection(true, col, (int)local.PlayerId); } catch { }
+                            local.RpcProtectPlayer(target, col);
+                            TriggerToast($"Permanent Shield ON for {target.Data.PlayerName}");
+                        }
+                    }
+                }
+
+                GUILayout.Space(12);
+                GUILayout.Label("🎭 Role Control", _boldLabelStyle);
+
+                PlayersTabManager.TargetRoleIdx = Mathf.Clamp(PlayersTabManager.TargetRoleIdx, 0, PlayersTabManager.RolesList.Length - 1);
+                GUILayout.BeginHorizontal();
+                if (GUILayout.Button("◄", _buttonStyle, GUILayout.Width(30), GUILayout.Height(24)))
+                {
+                    PlayersTabManager.TargetRoleIdx = (PlayersTabManager.TargetRoleIdx - 1 + PlayersTabManager.RolesList.Length) % PlayersTabManager.RolesList.Length;
+                }
+                GUILayout.Label($"<color=#55ff55><b>{PlayersTabManager.RoleNames[PlayersTabManager.TargetRoleIdx]}</b></color>", _boldLabelStyle, GUILayout.Width(140), GUILayout.Height(24));
+                if (GUILayout.Button("►", _buttonStyle, GUILayout.Width(30), GUILayout.Height(24)))
+                {
+                    PlayersTabManager.TargetRoleIdx = (PlayersTabManager.TargetRoleIdx + 1) % PlayersTabManager.RolesList.Length;
+                }
+                GUILayout.EndHorizontal();
+
+                RoleTypes selectedRole = PlayersTabManager.RolesList[PlayersTabManager.TargetRoleIdx];
+
+                GUILayout.Space(6);
+                GUILayout.BeginHorizontal();
+
+                if (GUILayout.Button("💾 Force on Start", _buttonStyle, GUILayout.Width(130), GUILayout.Height(26)))
+                {
+                    PlayersTabManager.ForcedRoles[target.PlayerId] = selectedRole;
+                    TriggerToast($"Assigned {selectedRole} to {target.Data.PlayerName} for game start!");
+                }
+
+                if (GUILayout.Button("⚡ Set Role NOW", _buttonStyle, GUILayout.Width(130), GUILayout.Height(26)))
+                {
+                    PlayersTabManager.ForcedRoles[target.PlayerId] = selectedRole;
+                    PlayersTabManager.ApplyRoleToPlayer(target, selectedRole);
+                    TriggerToast($"Set {target.Data.PlayerName} to {selectedRole}!");
+                }
+                GUILayout.EndHorizontal();
+
+                if (PlayersTabManager.ForcedRoles.Count > 0)
+                {
+                    GUILayout.Space(8);
+                    GUILayout.Label("<b>Active Forced Roles:</b>", _boldLabelStyle);
+                    foreach (var kvp in PlayersTabManager.ForcedRoles.ToList())
+                    {
+                        var p = PlayersTabManager.GetPlayerById(kvp.Key);
+                        string name = p?.Data?.PlayerName ?? ("ID " + kvp.Key);
+                        GUILayout.Label($"• {name} ➔ {kvp.Value}", _labelStyle);
+                    }
+                    if (GUILayout.Button("🗑 Clear All Role Assignments", _buttonStyle, GUILayout.Width(220), GUILayout.Height(24)))
+                    {
+                        PlayersTabManager.ForcedRoles.Clear();
+                        TriggerToast("Cleared all forced roles.");
+                    }
+                }
+            }
+
+            GUILayout.EndScrollView();
+            GUILayout.EndVertical();
+
+            GUILayout.EndHorizontal();
+        }
+
 
         private static Texture2D MakeTex(Color col)
         {
